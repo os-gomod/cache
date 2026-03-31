@@ -1,0 +1,41 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: go_cache_redis_dev
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+    command:
+      - redis-server
+      - --save
+      - ''
+      - --appendonly
+      - no
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --loglevel
+      - verbose
+    volumes:
+      - go_cache_redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 1s
+      retries: 5
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: go_cache_redis_commander_dev
+    restart: unless-stopped
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - '8081:8081'
+    depends_on:
+      - redis
+
+volumes:
+  go_cache_redis_data:
+    name: go_cache_redis_data
