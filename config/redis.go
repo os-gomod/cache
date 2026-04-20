@@ -29,8 +29,10 @@ type Redis struct {
 	Password                            string        `config:"password"`
 	DB                                  int           `config:"db" default:"0" validate:"min=0,max=15"`
 	PoolSize                            int           `config:"pool_size" default:"10" validate:"min=1,max=1000"`
+	PoolTimeout                         time.Duration `config:"pool_timeout" default:"4s" validate:"gte=0"`
 	MinIdleConns                        int           `config:"min_idle_conns" default:"2" validate:"min=0"`
 	MaxRetries                          int           `config:"max_retries" default:"3" validate:"min=0,max=10"`
+	ConnMaxIdleTime                     time.Duration `config:"conn_max_idle_time" default:"5m" validate:"gte=0"`
 	RetryBackoff                        time.Duration `config:"retry_backoff" default:"100ms" validate:"gte=0"`
 	DialTimeout                         time.Duration `config:"dial_timeout" default:"5s" validate:"gte=0"`
 	ReadTimeout                         time.Duration `config:"read_timeout" default:"3s" validate:"gte=0"`

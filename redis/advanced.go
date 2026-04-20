@@ -178,6 +178,64 @@ func (c *Cache) DeleteMulti(ctx context.Context, keys ...string) error {
 	return nil
 }
 
+// DeleteByPrefix removes all keys matching the given prefix.
+func (c *Cache) DeleteByPrefix(ctx context.Context, prefix string) error {
+	if err := c.checkClosed("redis.delete_by_prefix"); err != nil {
+		return err
+	}
+
+	op := observability.Op{Backend: "redis", Name: "delete_by_prefix", Key: prefix}
+	start := time.Now()
+	ctx = c.chain.Before(ctx, op)
+	var result observability.Result
+	defer func() {
+		result.Latency = time.Since(start)
+		c.chain.After(ctx, op, result)
+	}()
+
+	pattern := c.buildKey(prefix) + "*"
+
+	var cursor uint64
+	var keys []string
+
+	// 1. Scan all matching keys
+	for {
+		var batch []string
+		var err error
+		batch, cursor, err = c.client.Scan(ctx, cursor, pattern, 1000).Result()
+		if err != nil {
+			result.Err = err
+			return cacheerrors.Wrap("redis.delete_by_prefix", err)
+		}
+		keys = append(keys, batch...)
+		if cursor == 0 {
+			break
+		}
+	}
+
+	if len(keys) == 0 {
+		return nil
+	}
+
+	// 2. Delete in pipeline batches
+	const batchSize = 500
+	pipe := c.client.Pipeline()
+
+	for i, k := range keys {
+		pipe.Del(ctx, k)
+
+		if (i+1)%batchSize == 0 || i == len(keys)-1 {
+			if _, err := pipe.Exec(ctx); err != nil {
+				result.Err = err
+				return cacheerrors.Wrap("redis.delete_by_prefix", err)
+			}
+			pipe = c.client.Pipeline()
+		}
+	}
+
+	return nil
+}
+
 // GetOrSet retrieves the value for key, or calls fn to compute, cache, and return it.
 // When distributed stampede protection is enabled, it uses a Redis lock.
 func (c *Cache) GetOrSet(
@@ -400,7 +458,7 @@ func (c *Cache) HGet(ctx context.Context, key, field string) ([]byte, error) {
 
 // HGetAll retrieves all fields and values from a Redis hash.
 func (c *Cache) HGetAll(ctx context.Context, key string) (map[string]string, error) {
-	return observeResult[map[string]string](ctx, c, "redis.hgetall", key, func(ctx context.Context) (map[string]string, error) {
+	return observeResult(ctx, c, "redis.hgetall", key, func(ctx context.Context) (map[string]string, error) {
 		return c.client.HGetAll(ctx, c.buildKey(key)).Result()
 	})
 }
@@ -471,7 +529,7 @@ func (c *Cache) RPop(ctx context.Context, key string) ([]byte, error) {
 // LRange returns a range of elements from a Redis list.
 // nolint:dupl // The LPop/RPop and LRange implementations are similar but not worth abstracting further.
 func (c *Cache) LRange(ctx context.Context, key string, start, stop int64) ([]string, error) {
-	return observeResult[[]string](ctx, c, "redis.lrange", key, func(ctx context.Context) ([]string, error) {
+	return observeResult(ctx, c, "redis.lrange", key, func(ctx context.Context) ([]string, error) {
 		return c.client.LRange(ctx, c.buildKey(key), start, stop).Result()
 	})
 }
@@ -485,7 +543,7 @@ func (c *Cache) SAdd(ctx context.Context, key string, members ...any) error {
 
 // SMembers returns all members of a Redis set.
 func (c *Cache) SMembers(ctx context.Context, key string) ([]string, error) {
-	return observeResult[[]string](ctx, c, "redis.smembers", key, func(ctx context.Context) ([]string, error) {
+	return observeResult(ctx, c, "redis.smembers", key, func(ctx context.Context) ([]string, error) {
 		return c.client.SMembers(ctx, c.buildKey(key)).Result()
 	})
 }
@@ -507,7 +565,7 @@ func (c *Cache) ZAdd(ctx context.Context, key string, score float64, member stri
 // ZRange returns a range of members from a Redis sorted set by index.
 // nolint:dupl // The LPop/RPop and LRange implementations are similar but not worth abstracting further.
 func (c *Cache) ZRange(ctx context.Context, key string, start, stop int64) ([]string, error) {
-	return observeResult[[]string](ctx, c, "redis.zrange", key, func(ctx context.Context) ([]string, error) {
+	return observeResult(ctx, c, "redis.zrange", key, func(ctx context.Context) ([]string, error) {
 		return c.client.ZRange(ctx, c.buildKey(key), start, stop).Result()
 	})
 }

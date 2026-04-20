@@ -187,15 +187,15 @@ func TestPolicy_Execute_CircuitBreakerOpen(t *testing.T) {
 
 func TestPolicy_Execute_RateLimited(t *testing.T) {
 	limiter := NewLimiterWithConfig(LimiterConfig{
-		ReadRPS:   0, // zero rate means no limiting by tokenBucket
+		ReadRPS:   10, // zero rate means no limiting by tokenBucket
 		ReadBurst: 0,
 	})
-	// Actually, rate=0 allows all through tokenBucket. We need to test the Limiter path.
-	// Let's use a positive rate with burst=0 so it always blocks.
-	limiter = NewLimiterWithConfig(LimiterConfig{
-		ReadRPS:   10,
-		ReadBurst: 0,
-	})
+	// // Actually, rate=0 allows all through tokenBucket. We need to test the Limiter path.
+	// // Let's use a positive rate with burst=0 so it always blocks.
+	// limiter = NewLimiterWithConfig(LimiterConfig{
+	// 	ReadRPS:   10,
+	// 	ReadBurst: 0,
+	// })
 
 	p := Policy{
 		Limiter: limiter,
