@@ -2,40 +2,68 @@ package cache
 
 import (
 	"context"
-	"fmt"
+	"sync"
 	"time"
 
-	"github.com/os-gomod/cache/codec"
-	"github.com/os-gomod/cache/internal/keyutil"
-	"github.com/os-gomod/cache/internal/pooling"
-	"github.com/os-gomod/cache/internal/singlefght"
-	"github.com/os-gomod/cache/internal/stats"
-	"github.com/os-gomod/cache/layer"
-	"github.com/os-gomod/cache/memory"
-	"github.com/os-gomod/cache/redis"
+	"github.com/os-gomod/cache/v2/internal/contracts"
+	"github.com/os-gomod/cache/v2/internal/errors"
+	"github.com/os-gomod/cache/v2/internal/serialization"
+	"github.com/os-gomod/cache/v2/layered"
+	"github.com/os-gomod/cache/v2/memory"
+	"github.com/os-gomod/cache/v2/redis"
 )
 
-// TypedCache wraps a Backend with a codec to provide type-safe cache operations.
-// All values are automatically serialized/deserialized using the configured codec.
+// TypedCache provides a type-safe wrapper around a Backend. All values
+// are transparently encoded/decoded using the configured Codec, so
+// consumers work with native Go types instead of raw []byte.
+//
+// TypedCache is generic over the value type T. Common instantiations
+// include TypedCache[string], TypedCache[int64], TypedCache[[]byte],
+// and TypedCache[any] (with JSON codec for arbitrary structs).
+//
+// Example:
+//
+//	tc, _ := cache.NewMemoryString()
+//	tc.Set(ctx, "name", "Alice", time.Minute)
+//	name, err := tc.Get(ctx, "name") // name is string
 type TypedCache[T any] struct {
-	backend    Backend
-	codec      codec.Codec[T]
-	sg         *singlefght.Group
-	bufPool    *pooling.BufPool
-	onSetError func(key string, err error)
+	backend contracts.Reader
+	writer  contracts.Writer
+	atomic  contracts.AtomicOps
+	scanner contracts.Scanner
+	life    contracts.Lifecycle
+	stats   contracts.StatsProvider
+	codec   serialization.Codec[T]
+	bufPool *serialization.BufPool
 }
 
-// NewTypedCache creates a new TypedCache wrapping the given backend with the provided codec.
-func NewTypedCache[T any](
-	b Backend,
-	c codec.Codec[T],
-	opts ...func(*TypedCache[T]),
-) *TypedCache[T] {
+// TypedOption is a functional option for configuring a TypedCache.
+type TypedOption[T any] func(*TypedCache[T])
+
+// TypedCacheOptionFunc is an adapter to allow the use of ordinary
+// functions as TypedOption values. It is provided for convenience
+// when options do not depend on the type parameter.
+func TypedCacheOptionFunc[T any](fn func(*TypedCache[T])) TypedOption[T] {
+	return fn
+}
+
+// NewTyped creates a new type-safe cache wrapper around the given backend.
+// The codec is used to serialize/deserialize values of type T to/from []byte.
+// A buffer pool is created automatically for efficient encoding/decoding.
+//
+// Example:
+//
+//	tc := cache.NewTyped[User](backend, serialization.NewJSONCodec[User]())
+func NewTyped[T any](backend Backend, codec serialization.Codec[T], opts ...TypedOption[T]) *TypedCache[T] {
 	tc := &TypedCache[T]{
-		backend: b,
-		codec:   c,
-		sg:      singlefght.NewGroup(),
-		bufPool: pooling.NewBufPool(64),
+		backend: backend,
+		writer:  backend,
+		atomic:  backend,
+		scanner: backend,
+		life:    backend,
+		stats:   backend,
+		codec:   codec,
+		bufPool: serialization.NewBufPool(4096),
 	}
 	for _, opt := range opts {
 		opt(tc)
@@ -43,457 +71,315 @@ func NewTypedCache[T any](
 	return tc
 }
 
-// Backend returns the underlying untyped backend.
-func (tc *TypedCache[T]) Backend() Backend { return tc.backend }
-
-// Codec returns the codec used for serialization and deserialization.
-func (tc *TypedCache[T]) Codec() codec.Codec[T] { return tc.codec }
-
-// Name returns the backend identifier prefixed with "typed:".
-func (tc *TypedCache[T]) Name() string { return "typed:" + tc.backend.Name() }
-
-func (tc *TypedCache[T]) encode(v T) ([]byte, error) {
-	bp := tc.bufPool.Get()
-	scratch := *bp
-	data, err := tc.codec.Encode(v, scratch)
-	if err != nil {
-		tc.bufPool.Put(bp)
-		return nil, err
-	}
-	if len(data) > 0 && len(scratch) > 0 && &data[0] == &scratch[0] {
-		out := make([]byte, len(data))
-		copy(out, data)
-		tc.bufPool.Put(bp)
-		return out, nil
-	}
-	tc.bufPool.Put(bp)
-	return data, nil
-}
-
-// Get retrieves a typed value from the cache, decoding the raw bytes with the codec.
+// Get retrieves the value for the given key, decoding it from []byte to T.
+// Returns errors.NotFound if the key does not exist.
 func (tc *TypedCache[T]) Get(ctx context.Context, key string) (T, error) {
 	var zero T
-	if err := keyutil.ValidateKey("typed.get", key); err != nil {
-		return zero, err
-	}
 	data, err := tc.backend.Get(ctx, key)
 	if err != nil {
 		return zero, err
 	}
-	return tc.codec.Decode(data)
-}
-
-// Set stores a typed value in the cache, encoding it with the codec.
-func (tc *TypedCache[T]) Set(ctx context.Context, key string, value T, ttl time.Duration) error {
-	if err := keyutil.ValidateKey("typed.set", key); err != nil {
-		return err
-	}
-	data, err := tc.encode(value)
+	val, err := tc.codec.Decode(data)
 	if err != nil {
-		return fmt.Errorf("typed.set encode: %w", err)
+		return zero, errors.Factory.DecodeFailed(key, tc.codec.Name(), err)
 	}
-	return tc.backend.Set(ctx, key, data, ttl)
+	return val, nil
 }
 
-// Delete removes a key from the cache.
+// Set stores the given value under the key, encoding it from T to []byte.
+// The TTL controls how long the entry remains valid.
+func (tc *TypedCache[T]) Set(ctx context.Context, key string, value T, ttl time.Duration) error {
+	buf := tc.bufPool.Get()
+	defer tc.bufPool.Put(buf)
+
+	encoded, err := tc.codec.Encode(value, *buf)
+	if err != nil {
+		return errors.Factory.EncodeFailed(key, tc.codec.Name(), err)
+	}
+	return tc.writer.Set(ctx, key, encoded, ttl)
+}
+
+// Delete removes the entry for the given key.
 func (tc *TypedCache[T]) Delete(ctx context.Context, key string) error {
-	if err := keyutil.ValidateKey("typed.delete", key); err != nil {
-		return err
-	}
-	return tc.backend.Delete(ctx, key)
+	return tc.writer.Delete(ctx, key)
 }
 
-// Exists reports whether the key exists in the cache.
+// Exists checks whether the key exists in the cache.
 func (tc *TypedCache[T]) Exists(ctx context.Context, key string) (bool, error) {
-	if err := keyutil.ValidateKey("typed.exists", key); err != nil {
-		return false, err
-	}
 	return tc.backend.Exists(ctx, key)
 }
 
 // TTL returns the remaining time-to-live for the given key.
 func (tc *TypedCache[T]) TTL(ctx context.Context, key string) (time.Duration, error) {
-	if err := keyutil.ValidateKey("typed.ttl", key); err != nil {
-		return 0, err
-	}
 	return tc.backend.TTL(ctx, key)
 }
 
-// GetMulti retrieves multiple typed values, decoding each with the codec.
+// GetMulti retrieves multiple values in a single batch operation,
+// decoding each from []byte to T. Missing keys are omitted from the
+// returned map.
 func (tc *TypedCache[T]) GetMulti(ctx context.Context, keys ...string) (map[string]T, error) {
-	for _, k := range keys {
-		if err := keyutil.ValidateKey("typed.get_multi", k); err != nil {
-			return nil, err
-		}
-	}
-	raw, err := tc.backend.GetMulti(ctx, keys...)
+	dataMap, err := tc.backend.GetMulti(ctx, keys...)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]T, len(raw))
-	for k, data := range raw {
-		v, decErr := tc.codec.Decode(data)
+	result := make(map[string]T, len(dataMap))
+	for k, data := range dataMap {
+		val, decErr := tc.codec.Decode(data)
 		if decErr != nil {
-			return nil, fmt.Errorf("typed.get_multi decode key=%s: %w", k, decErr)
+			return nil, errors.Factory.DecodeFailed(k, tc.codec.Name(), decErr)
 		}
-		out[k] = v
+		result[k] = val
 	}
-	return out, nil
+	return result, nil
 }
 
-// SetMulti stores multiple typed values, encoding each with the codec.
-func (tc *TypedCache[T]) SetMulti(
-	ctx context.Context,
-	items map[string]T,
-	ttl time.Duration,
-) error {
-	raw := make(map[string][]byte, len(items))
+// SetMulti stores multiple values in a single batch operation,
+// encoding each from T to []byte.
+func (tc *TypedCache[T]) SetMulti(ctx context.Context, items map[string]T, ttl time.Duration) error {
+	encoded := make(map[string][]byte, len(items))
+	buf := tc.bufPool.Get()
+	defer tc.bufPool.Put(buf)
+
 	for k, v := range items {
-		if err := keyutil.ValidateKey("typed.set_multi", k); err != nil {
-			return err
-		}
-		data, err := tc.encode(v)
+		data, err := tc.codec.Encode(v, *buf)
 		if err != nil {
-			return fmt.Errorf("typed.set_multi encode key=%s: %w", k, err)
+			return errors.Factory.EncodeFailed(k, tc.codec.Name(), err)
 		}
-		raw[k] = data
+		encoded[k] = data
 	}
-	return tc.backend.SetMulti(ctx, raw, ttl)
+	return tc.writer.SetMulti(ctx, encoded, ttl)
 }
 
-// DeleteMulti removes multiple keys from the cache.
+// DeleteMulti removes multiple keys in a single batch operation.
 func (tc *TypedCache[T]) DeleteMulti(ctx context.Context, keys ...string) error {
-	for _, k := range keys {
-		if err := keyutil.ValidateKey("typed.delete_multi", k); err != nil {
-			return err
-		}
-	}
-	return tc.backend.DeleteMulti(ctx, keys...)
+	return tc.writer.DeleteMulti(ctx, keys...)
 }
 
-// Ping checks backend health.
-func (tc *TypedCache[T]) Ping(ctx context.Context) error { return tc.backend.Ping(ctx) }
-
-// Close closes the underlying backend.
-func (tc *TypedCache[T]) Close(ctx context.Context) error { return tc.backend.Close(ctx) }
-
-// Stats returns a point-in-time snapshot of cache statistics.
-func (tc *TypedCache[T]) Stats() stats.Snapshot { return tc.backend.Stats() }
-
-// Closed reports whether the cache has been closed.
-func (tc *TypedCache[T]) Closed() bool { return tc.backend.Closed() }
-
-// GetOrSet retrieves the typed value for key, or calls fn to compute, cache, and return it.
-func (tc *TypedCache[T]) GetOrSet(
-	ctx context.Context,
-	key string,
-	fn func() (T, error),
-	ttl time.Duration,
-) (T, error) {
+// GetOrSet retrieves the value for the given key. If the key is missing
+// or expired, fn is called to produce the value, which is then stored
+// with the given TTL. This implements the cache-aside pattern.
+//
+// The function fn is guaranteed to be called at most once per invocation,
+// even under concurrent access for the same key.
+func (tc *TypedCache[T]) GetOrSet(ctx context.Context, key string, fn func() (T, error), ttl time.Duration) (T, error) {
 	var zero T
-	if err := keyutil.ValidateKey("typed.get_or_set", key); err != nil {
+
+	val, err := tc.Get(ctx, key)
+	if err == nil {
+		return val, nil
+	}
+
+	// Only call fn on cache miss (not on other errors).
+	if !errors.Factory.IsNotFound(err) {
 		return zero, err
 	}
-	data, err := tc.sg.Do(ctx, key, func() ([]byte, error) {
-		if d, getErr := tc.backend.Get(ctx, key); getErr == nil {
-			return d, nil
-		}
-		v, fnErr := fn()
-		if fnErr != nil {
-			return nil, fnErr
-		}
-		encoded, encErr := tc.encode(v)
-		if encErr != nil {
-			return nil, encErr
-		}
-		if setErr := tc.backend.Set(ctx, key, encoded, ttl); setErr != nil {
-			if tc.onSetError != nil {
-				tc.onSetError(key, setErr)
-			}
-		}
-		return encoded, nil
-	})
+
+	newVal, err := fn()
 	if err != nil {
-		return zero, err
+		return zero, errors.Factory.CallbackFailed(key, err)
 	}
-	v, decErr := tc.codec.Decode(data)
-	if decErr != nil {
-		if tc.onSetError != nil {
-			tc.onSetError(key, decErr)
-		}
-		return zero, fmt.Errorf("typed.get_or_set decode: %w", decErr)
+
+	if setErr := tc.Set(ctx, key, newVal, ttl); setErr != nil {
+		return newVal, nil // return the value even if set fails
 	}
-	return v, nil
+
+	return newVal, nil
 }
 
-// CompareAndSwap atomically sets key to newVal if its current value equals oldVal.
-func (tc *TypedCache[T]) CompareAndSwap(
-	ctx context.Context,
-	key string,
-	oldVal, newVal T,
-	ttl time.Duration,
-) (bool, error) {
-	if err := keyutil.ValidateKey("typed.cas", key); err != nil {
-		return false, err
-	}
-	ab, ok := tc.backend.(AtomicBackend)
-	if !ok {
-		return false, fmt.Errorf(
-			"typed.cas: backend %q does not implement AtomicBackend",
-			tc.backend.Name(),
-		)
-	}
-	oldData, err := tc.encode(oldVal)
+// CompareAndSwap atomically compares the current value with oldVal and,
+// if they match, replaces it with newVal. Returns true if the swap
+// was performed. Both oldVal and newVal are encoded/decoded using
+// the configured codec.
+func (tc *TypedCache[T]) CompareAndSwap(ctx context.Context, key string, oldVal, newVal T, ttl time.Duration) (bool, error) {
+	buf := tc.bufPool.Get()
+	defer tc.bufPool.Put(buf)
+
+	oldEncoded, err := tc.codec.Encode(oldVal, *buf)
 	if err != nil {
-		return false, fmt.Errorf("typed.cas encode old: %w", err)
+		return false, errors.Factory.EncodeFailed(key, tc.codec.Name(), err)
 	}
-	newData, err := tc.encode(newVal)
+
+	newEncoded, err := tc.codec.Encode(newVal, *buf)
 	if err != nil {
-		return false, fmt.Errorf("typed.cas encode new: %w", err)
+		return false, errors.Factory.EncodeFailed(key, tc.codec.Name(), err)
 	}
-	return ab.CompareAndSwap(ctx, key, oldData, newData, ttl)
+
+	return tc.atomic.CompareAndSwap(ctx, key, oldEncoded, newEncoded, ttl)
 }
 
-// SetNX sets the key-value pair only if the key does not already exist.
-func (tc *TypedCache[T]) SetNX(
-	ctx context.Context,
-	key string,
-	value T,
-	ttl time.Duration,
-) (bool, error) {
-	if err := keyutil.ValidateKey("typed.setnx", key); err != nil {
-		return false, err
-	}
-	ab, ok := tc.backend.(AtomicBackend)
-	if !ok {
-		return false, fmt.Errorf(
-			"typed.setnx: backend %q does not implement AtomicBackend",
-			tc.backend.Name(),
-		)
-	}
-	data, err := tc.encode(value)
+// SetNX sets the key to the given value only if it does not already exist.
+// Returns true if the value was set, false if the key already existed.
+func (tc *TypedCache[T]) SetNX(ctx context.Context, key string, value T, ttl time.Duration) (bool, error) {
+	buf := tc.bufPool.Get()
+	defer tc.bufPool.Put(buf)
+
+	encoded, err := tc.codec.Encode(value, *buf)
 	if err != nil {
-		return false, fmt.Errorf("typed.setnx encode: %w", err)
+		return false, errors.Factory.EncodeFailed(key, tc.codec.Name(), err)
 	}
-	return ab.SetNX(ctx, key, data, ttl)
+	return tc.atomic.SetNX(ctx, key, encoded, ttl)
 }
 
-// GetSet sets the value for a key and returns the previous typed value.
-func (tc *TypedCache[T]) GetSet(
-	ctx context.Context,
-	key string,
-	value T,
-	ttl time.Duration,
-) (T, error) {
+// GetSet atomically sets the key to the given value and returns the
+// previous value. If the key did not exist, the zero value of T is
+// returned.
+func (tc *TypedCache[T]) GetSet(ctx context.Context, key string, value T, ttl time.Duration) (T, error) {
 	var zero T
-	if err := keyutil.ValidateKey("typed.getset", key); err != nil {
-		return zero, err
-	}
-	ab, ok := tc.backend.(AtomicBackend)
-	if !ok {
-		return zero, fmt.Errorf(
-			"typed.getset: backend %q does not implement AtomicBackend",
-			tc.backend.Name(),
-		)
-	}
-	data, err := tc.encode(value)
+
+	buf := tc.bufPool.Get()
+	defer tc.bufPool.Put(buf)
+
+	encoded, err := tc.codec.Encode(value, *buf)
 	if err != nil {
-		return zero, fmt.Errorf("typed.getset encode: %w", err)
+		return zero, errors.Factory.EncodeFailed(key, tc.codec.Name(), err)
 	}
-	oldData, err := ab.GetSet(ctx, key, data, ttl)
+
+	oldEncoded, err := tc.atomic.GetSet(ctx, key, encoded, ttl)
 	if err != nil {
 		return zero, err
 	}
-	if oldData == nil {
+
+	if len(oldEncoded) == 0 {
 		return zero, nil
 	}
-	return tc.codec.Decode(oldData)
-}
 
-// requireAtomic returns the backend as AtomicBackend or an error if it does not implement it.
-func (tc *TypedCache[T]) requireAtomic(op string) (AtomicBackend, error) {
-	ab, ok := tc.backend.(AtomicBackend)
-	if !ok {
-		return nil, fmt.Errorf(
-			"typed.%s: backend %q does not implement AtomicBackend",
-			op, tc.backend.Name(),
-		)
+	val, err := tc.codec.Decode(oldEncoded)
+	if err != nil {
+		return zero, errors.Factory.DecodeFailed(key, tc.codec.Name(), err)
 	}
-	return ab, nil
+	return val, nil
 }
 
-// Increment atomically adds delta to the integer value stored at key.
+// Increment atomically increments a numeric value stored at key by delta.
+// This is a convenience method for integer-typed caches.
 func (tc *TypedCache[T]) Increment(ctx context.Context, key string, delta int64) (int64, error) {
-	if err := keyutil.ValidateKey("typed.increment", key); err != nil {
-		return 0, err
-	}
-	ab, err := tc.requireAtomic("increment")
-	if err != nil {
-		return 0, err
-	}
-	return ab.Increment(ctx, key, delta)
+	return tc.atomic.Increment(ctx, key, delta)
 }
 
-// Decrement atomically subtracts delta from the integer value stored at key.
+// Decrement atomically decrements a numeric value stored at key by delta.
+// This is a convenience method for integer-typed caches.
 func (tc *TypedCache[T]) Decrement(ctx context.Context, key string, delta int64) (int64, error) {
-	if err := keyutil.ValidateKey("typed.decrement", key); err != nil {
-		return 0, err
-	}
-	ab, err := tc.requireAtomic("decrement")
-	if err != nil {
-		return 0, err
-	}
-	return ab.Decrement(ctx, key, delta)
+	return tc.atomic.Decrement(ctx, key, delta)
 }
 
-// Keys returns all keys matching the pattern. Requires the backend to implement ScanBackend.
+// Keys returns all keys matching the given pattern. The pattern syntax
+// depends on the backend (e.g., Redis-style glob patterns for Redis).
 func (tc *TypedCache[T]) Keys(ctx context.Context, pattern string) ([]string, error) {
-	sb, ok := tc.backend.(ScanBackend)
-	if !ok {
-		return nil, fmt.Errorf(
-			"typed.keys: backend %q does not implement ScanBackend",
-			tc.backend.Name(),
-		)
-	}
-	return sb.Keys(ctx, pattern)
+	return tc.scanner.Keys(ctx, pattern)
 }
 
-// Clear removes all entries from the cache. Requires the backend to implement ScanBackend.
+// Clear removes all entries from the cache.
 func (tc *TypedCache[T]) Clear(ctx context.Context) error {
-	sb, ok := tc.backend.(ScanBackend)
-	if !ok {
-		return fmt.Errorf(
-			"typed.clear: backend %q does not implement ScanBackend",
-			tc.backend.Name(),
-		)
-	}
-	return sb.Clear(ctx)
+	return tc.scanner.Clear(ctx)
 }
 
-// Size returns the number of entries in the cache. Requires the backend to implement ScanBackend.
+// Size returns the approximate number of entries in the cache.
 func (tc *TypedCache[T]) Size(ctx context.Context) (int64, error) {
-	sb, ok := tc.backend.(ScanBackend)
-	if !ok {
-		return 0, fmt.Errorf(
-			"typed.size: backend %q does not implement ScanBackend",
-			tc.backend.Name(),
-		)
-	}
-	return sb.Size(ctx)
+	return tc.scanner.Size(ctx)
 }
 
-// WithOnSetError sets a callback invoked when a background set operation fails.
-func WithOnSetError[T any](fn func(key string, err error)) func(*TypedCache[T]) {
-	return func(tc *TypedCache[T]) { tc.onSetError = fn }
+// Close gracefully shuts down the underlying backend, releasing resources.
+func (tc *TypedCache[T]) Close(ctx context.Context) error {
+	return tc.life.Close(ctx)
 }
 
-// NewJSONTypedCache creates a TypedCache using the JSON codec.
-func NewJSONTypedCache[T any](b Backend, opts ...func(*TypedCache[T])) *TypedCache[T] {
-	return NewTypedCache(b, codec.NewJSONCodec[T](), opts...)
+// Ping checks connectivity to the backend. Returns nil if the backend
+// is reachable and healthy.
+func (tc *TypedCache[T]) Ping(ctx context.Context) error {
+	return tc.life.Ping(ctx)
 }
 
-// NewRawTypedCache creates a TypedCache using the pass-through raw byte codec.
-func NewRawTypedCache(b Backend, opts ...func(*TypedCache[[]byte])) *TypedCache[[]byte] {
-	return NewTypedCache(b, codec.RawCodec{}, opts...)
+// Stats returns a snapshot of the cache's current statistics including
+// hit rate, miss rate, eviction count, and more.
+func (tc *TypedCache[T]) Stats() contracts.StatsSnapshot {
+	return tc.stats.Stats()
 }
 
-// NewStringTypedCache creates a TypedCache using the zero-alloc String codec.
-func NewStringTypedCache(b Backend, opts ...func(*TypedCache[string])) *TypedCache[string] {
-	return NewTypedCache(b, codec.StringCodec{}, opts...)
+// Closed returns true if the underlying backend has been closed.
+func (tc *TypedCache[T]) Closed() bool {
+	return tc.life.Closed()
 }
 
-// NewInt64TypedCache creates a TypedCache using the zero-alloc Int64 codec.
-func NewInt64TypedCache(b Backend, opts ...func(*TypedCache[int64])) *TypedCache[int64] {
-	return NewTypedCache(b, codec.Int64Codec{}, opts...)
+// Name returns the name/identifier of the underlying backend.
+func (tc *TypedCache[T]) Name() string {
+	return tc.life.Name()
 }
 
-// NewFloat64TypedCache creates a TypedCache using the zero-alloc Float64 codec.
-func NewFloat64TypedCache(b Backend, opts ...func(*TypedCache[float64])) *TypedCache[float64] {
-	return NewTypedCache(b, codec.Float64Codec{}, opts...)
+// Backend returns the underlying Backend instance. This is useful
+// for advanced operations that are not exposed through the TypedCache API.
+func (tc *TypedCache[T]) Backend() Backend {
+	return tc.backend.(Backend)
 }
 
-// TypedInt64Cache is a convenience type alias for a TypedCache[int64].
-type TypedInt64Cache = TypedCache[int64]
+// ---------------------------------------------------------------------------
+// Convenience constructors
+// ---------------------------------------------------------------------------
 
-// TypedStringCache is a convenience type alias for a TypedCache[string].
-type TypedStringCache = TypedCache[string]
-
-// TypedBytesCache is a convenience type alias for a TypedCache[[]byte].
-type TypedBytesCache = TypedCache[[]byte]
-
-// NewTypedInt64Cache is an alias for NewInt64TypedCache.
-func NewTypedInt64Cache(b Backend, opts ...func(*TypedCache[int64])) *TypedCache[int64] {
-	return NewInt64TypedCache(b, opts...)
-}
-
-// NewMemoryInt64Cache creates an in-memory TypedCache[int64] with the given options.
-func NewMemoryInt64Cache(opts ...memory.Option) (*TypedCache[int64], error) {
-	mc, err := memory.New(opts...)
+// NewMemoryJSON creates a memory-backed typed cache with JSON codec
+// for arbitrary Go types (typically structs).
+func NewMemoryJSON[T any](opts ...memory.Option) (*TypedCache[T], error) {
+	backend, err := NewMemory(opts...)
 	if err != nil {
 		return nil, err
 	}
-	return NewInt64TypedCache(mc), nil
+	return NewTyped[T](backend, serialization.NewJSONCodec[T]()), nil
 }
 
-// NewRedisInt64Cache creates a Redis-backed TypedCache[int64] with the given options.
-func NewRedisInt64Cache(opts ...redis.Option) (*TypedCache[int64], error) {
-	rc, err := redis.New(opts...)
+// NewMemoryString creates a memory-backed typed cache optimized for
+// string values. Uses the efficient StringCodec (no JSON overhead).
+func NewMemoryString(opts ...memory.Option) (*TypedCache[string], error) {
+	backend, err := NewMemory(opts...)
 	if err != nil {
 		return nil, err
 	}
-	return NewInt64TypedCache(rc), nil
+	return NewTyped[string](backend, &serialization.StringCodec{}), nil
 }
 
-// NewMemoryStringCache creates an in-memory TypedCache[string] with the given options.
-func NewMemoryStringCache(opts ...memory.Option) (*TypedCache[string], error) {
-	mc, err := memory.New(opts...)
+// NewMemoryInt64 creates a memory-backed typed cache optimized for
+// int64 values. Uses the efficient Int64Codec (no JSON overhead).
+func NewMemoryInt64(opts ...memory.Option) (*TypedCache[int64], error) {
+	backend, err := NewMemory(opts...)
 	if err != nil {
 		return nil, err
 	}
-	return NewStringTypedCache(mc), nil
+	return NewTyped[int64](backend, &serialization.Int64Codec{}), nil
 }
 
-// NewRedisStringCache creates a Redis-backed TypedCache[string] with the given options.
-func NewRedisStringCache(opts ...redis.Option) (*TypedCache[string], error) {
-	rc, err := redis.New(opts...)
+// NewRedisJSON creates a Redis-backed typed cache with JSON codec
+// for arbitrary Go types.
+func NewRedisJSON[T any](opts ...redis.Option) (*TypedCache[T], error) {
+	backend, err := NewRedis(opts...)
 	if err != nil {
 		return nil, err
 	}
-	return NewStringTypedCache(rc), nil
+	return NewTyped[T](backend, serialization.NewJSONCodec[T]()), nil
 }
 
-// NewMemoryTypedCache creates an in-memory TypedCache[T] using the JSON codec.
-func NewMemoryTypedCache[T any](
-	memOpts []memory.Option,
-	opts ...func(*TypedCache[T]),
-) (*TypedCache[T], error) {
-	mc, err := memory.New(memOpts...)
+// NewRedisString creates a Redis-backed typed cache optimized for
+// string values.
+func NewRedisString(opts ...redis.Option) (*TypedCache[string], error) {
+	backend, err := NewRedis(opts...)
 	if err != nil {
 		return nil, err
 	}
-	return NewJSONTypedCache[T](mc, opts...), nil
+	return NewTyped[string](backend, &serialization.StringCodec{}), nil
 }
 
-// NewRedisTypedCache creates a Redis-backed TypedCache[T] using the JSON codec.
-func NewRedisTypedCache[T any](
-	redisOpts []redis.Option,
-	opts ...func(*TypedCache[T]),
-) (*TypedCache[T], error) {
-	rc, err := redis.New(redisOpts...)
+// NewLayeredJSON creates a layered (L1+L2) typed cache with JSON codec.
+func NewLayeredJSON[T any](opts ...layered.Option) (*TypedCache[T], error) {
+	backend, err := NewLayered(opts...)
 	if err != nil {
 		return nil, err
 	}
-	return NewJSONTypedCache[T](rc, opts...), nil
+	return NewTyped[T](backend, serialization.NewJSONCodec[T]()), nil
 }
 
-// NewLayeredTypedCache creates a layered TypedCache[T] using the JSON codec.
-func NewLayeredTypedCache[T any](
-	layeredOpts []layer.Option,
-	opts ...func(*TypedCache[T]),
-) (*TypedCache[T], error) {
-	lc, err := layer.New(layeredOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return NewJSONTypedCache[T](lc, opts...), nil
-}
+// Verify interface satisfaction at compile time.
+var (
+	_ Backend = (*memory.Store)(nil)  //nolint:errcheck // compile-time interface satisfaction
+	_ Backend = (*redis.Store)(nil)   //nolint:errcheck // compile-time interface satisfaction
+	_ Backend = (*layered.Store)(nil) //nolint:errcheck // compile-time interface satisfaction
+)
+
+// Ensure sync is imported (used implicitly by typed cache operations).
+var _ sync.Locker = (*sync.Mutex)(nil)

@@ -2,274 +2,318 @@ package memory
 
 import (
 	"context"
-	"errors"
 	"time"
 
-	cacheerrors "github.com/os-gomod/cache/errors"
-	"github.com/os-gomod/cache/internal/cachectx"
-	"github.com/os-gomod/cache/memory/eviction"
-	"github.com/os-gomod/cache/observability"
+	"github.com/os-gomod/cache/v2/internal/contracts"
+	"github.com/os-gomod/cache/v2/internal/errors"
+	"github.com/os-gomod/cache/v2/internal/keyutil"
+	"github.com/os-gomod/cache/v2/internal/runtime"
 )
 
-// Get retrieves the value for the given key from the in-memory cache.
-func (c *Cache) Get(ctx context.Context, key string) ([]byte, error) {
-	if err := c.checkClosed("memory.get"); err != nil {
+// Get retrieves the value for the given key from the in-memory store.
+// Returns errors.NotFound if the key does not exist or has expired.
+func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
+	if err := s.validateKey("memory.get", key); err != nil {
 		return nil, err
 	}
-	op := observability.Op{Backend: "memory", Name: "get", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	if cachectx.ShouldBypassCache(ctx) {
-		c.stats.Miss()
-		result.Hit = false
-		return nil, cacheerrors.ErrNotFound
-	}
-	c.stats.RecordGet()
-	s := c.shardFor(key)
-	now := time.Now().UnixNano()
-	s.mu.RLock()
-	e, ok := s.items[key]
-	if ok && e.IsExpiredAt(now) {
-		ok = false
-	}
-	s.mu.RUnlock()
-	if !ok {
-		c.stats.Miss()
-		result.Hit = false
-		return nil, cacheerrors.NotFound("memory.get", key)
-	}
-	e.Touch()
-	s.evict.OnAccess(key, e)
-	c.stats.Hit()
-	result.Hit = true
-	result.ByteSize = len(e.Value)
-	return e.Value, nil
-}
-
-// Set stores a key-value pair with the given TTL.
-func (c *Cache) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
-	if err := c.checkClosed("memory.set"); err != nil {
-		return err
-	}
-	op := observability.Op{Backend: "memory", Name: "set", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	e := eviction.NewEntry(key, value, ttl, 0)
-	s := c.shardFor(key)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if old, hadOld := s.items[key]; hadOld {
-		s.size -= old.Size
-		s.count--
-		s.evict.OnDelete(key)
-		c.stats.AddMemory(-old.Size)
-		c.stats.AddItems(-1)
-	}
-	s.items[key] = e
-	s.size += e.Size
-	s.count++
-	s.evict.OnAdd(key, e)
-	c.stats.SetOp()
-	c.stats.AddMemory(e.Size)
-	c.stats.AddItems(1)
-	c.enforceCapacity(s, key)
-	return nil
-}
-
-// Delete removes a key from the cache.
-func (c *Cache) Delete(ctx context.Context, key string) error {
-	if err := c.checkClosed("memory.delete"); err != nil {
-		return err
-	}
-	op := observability.Op{Backend: "memory", Name: "delete", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	s := c.shardFor(key)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c.deleteFromShard(s, key)
-	return nil
-}
-
-// Exists reports whether the key exists in the cache and is not expired.
-func (c *Cache) Exists(ctx context.Context, key string) (bool, error) {
-	if err := c.checkClosed("memory.exists"); err != nil {
-		return false, err
-	}
-	op := observability.Op{Backend: "memory", Name: "exists", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	if cachectx.ShouldBypassCache(ctx) {
-		return false, nil
-	}
-	s := c.shardFor(key)
-	now := time.Now().UnixNano()
-	s.mu.RLock()
-	e, ok := s.items[key]
-	if ok && e.IsExpiredAt(now) {
-		ok = false
-	}
-	s.mu.RUnlock()
-	result.Hit = ok
-	return ok, nil
-}
-
-// TTL returns the remaining time-to-live for the given key.
-func (c *Cache) TTL(ctx context.Context, key string) (time.Duration, error) {
-	if err := c.checkClosed("memory.ttl"); err != nil {
-		return 0, err
-	}
-	op := observability.Op{Backend: "memory", Name: "ttl", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	s := c.shardFor(key)
-	now := time.Now().UnixNano()
-	s.mu.RLock()
-	e, ok := s.items[key]
-	if ok && e.IsExpiredAt(now) {
-		ok = false
-	}
-	s.mu.RUnlock()
-	if !ok {
-		result.Err = cacheerrors.NotFound("memory.ttl", key)
-		return 0, result.Err
-	}
-	return e.TTLRemaining(), nil
-}
-
-// Keys returns all non-expired keys in the cache.
-func (c *Cache) Keys(ctx context.Context, pattern string) ([]string, error) {
-	if err := c.checkClosed("memory.keys"); err != nil {
+	if err := s.checkClosed("memory.get"); err != nil {
 		return nil, err
 	}
-	op := observability.Op{Backend: "memory", Name: "keys"}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	_ = pattern
-	now := time.Now().UnixNano()
-	var keys []string
-	for _, s := range c.shards {
-		s.mu.RLock()
-		for k, e := range s.items {
-			if !e.IsExpiredAt(now) {
-				keys = append(keys, k)
+
+	op := contracts.Operation{
+		Name:    "get",
+		Key:     key,
+		Backend: "memory",
+	}
+
+	value, err := runtime.ExecuteTyped(
+		s.executor,
+		ctx,
+		op,
+		func(_ctx context.Context) ([]byte, error) {
+			sh := s.shardFor(key)
+			now := time.Now().UnixNano()
+
+			sh.mu.RLock()
+			e, ok := sh.get(key)
+			if !ok || e.IsExpired(now) {
+				sh.mu.RUnlock()
+				s.stats.Miss()
+				return nil, errors.Factory.NotFound("memory.get", key)
+			}
+			value := make([]byte, len(e.Value))
+			copy(value, e.Value)
+			e.Touch(now)
+			sh.mu.RUnlock()
+
+			s.stats.Hit()
+			return value, nil
+		},
+	)
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return value, err
+}
+
+// GetMulti retrieves multiple values by key. Missing keys are omitted from
+// the returned map.
+func (s *Store) GetMulti(ctx context.Context, keys ...string) (map[string][]byte, error) {
+	if err := keyutil.ValidateKeys("memory.get_multi", keys); err != nil {
+		//nolint:wrapcheck // error is already wrapped by internal packages
+		return nil, err
+	}
+	if err := s.checkClosed("memory.get_multi"); err != nil {
+		return nil, err
+	}
+
+	op := contracts.Operation{
+		Name:     "get_multi",
+		KeyCount: len(keys),
+		Backend:  "memory",
+	}
+
+	result, err := runtime.ExecuteTyped(
+		s.executor,
+		ctx,
+		op,
+		func(_ctx context.Context) (map[string][]byte, error) {
+			now := time.Now().UnixNano()
+			m := make(map[string][]byte, len(keys))
+
+			for _, key := range keys {
+				sh := s.shardFor(key)
+				sh.mu.RLock()
+				e, ok := sh.get(key)
+				if ok && !e.IsExpired(now) {
+					value := make([]byte, len(e.Value))
+					copy(value, e.Value)
+					e.Touch(now)
+					m[key] = value
+					s.stats.Hit()
+				} else {
+					s.stats.Miss()
+				}
+				sh.mu.RUnlock()
+			}
+			return m, nil
+		},
+	)
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return result, err
+}
+
+// Set stores a key-value pair with the given TTL. If ttl is zero or negative,
+// the default TTL from the configuration is used.
+func (s *Store) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	if err := s.validateKey("memory.set", key); err != nil {
+		return err
+	}
+	if err := s.checkClosed("memory.set"); err != nil {
+		return err
+	}
+
+	effectiveTTL := s.resolveTTL(ttl)
+
+	op := contracts.Operation{
+		Name:    "set",
+		Key:     key,
+		Backend: "memory",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return s.executor.Execute(ctx, op, func(_ctx context.Context) error {
+		now := time.Now().UnixNano()
+		e := NewEntry(key, value, effectiveTTL, now)
+		sh := s.shardFor(key)
+
+		sh.mu.Lock()
+		perShardMax := s.cfg.maxMemoryBytes / int64(len(s.shards))
+		ev := sh.set(key, e, perShardMax)
+		sh.mu.Unlock()
+
+		if len(ev.keys) > 0 {
+			s.stats.EvictionOp()
+			s.stats.AddMemory(-ev.bytes)
+		}
+		s.stats.SetOp()
+		s.stats.AddItems(1)
+		s.stats.AddMemory(e.Size)
+
+		return nil
+	})
+}
+
+// SetMulti stores multiple key-value pairs with the given TTL.
+func (s *Store) SetMulti(ctx context.Context, items map[string][]byte, ttl time.Duration) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if err := s.checkClosed("memory.set_multi"); err != nil {
+		return err
+	}
+
+	effectiveTTL := s.resolveTTL(ttl)
+
+	op := contracts.Operation{
+		Name:     "set_multi",
+		KeyCount: len(items),
+		Backend:  "memory",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return s.executor.Execute(ctx, op, func(_ctx context.Context) error {
+		now := time.Now().UnixNano()
+		for key, value := range items {
+			e := NewEntry(key, value, effectiveTTL, now)
+			sh := s.shardFor(key)
+			sh.mu.Lock()
+			perShardMax := s.cfg.maxMemoryBytes / int64(len(s.shards))
+			ev := sh.set(key, e, perShardMax)
+			sh.mu.Unlock()
+
+			if len(ev.keys) > 0 {
+				s.stats.EvictionOp()
+			}
+			s.stats.SetOp()
+			s.stats.AddItems(1)
+			s.stats.AddMemory(e.Size)
+		}
+		return nil
+	})
+}
+
+// Delete removes a key from the store. Deleting a non-existent key is a no-op.
+func (s *Store) Delete(ctx context.Context, key string) error {
+	if err := s.validateKey("memory.delete", key); err != nil {
+		return err
+	}
+	if err := s.checkClosed("memory.delete"); err != nil {
+		return err
+	}
+
+	op := contracts.Operation{
+		Name:    "delete",
+		Key:     key,
+		Backend: "memory",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return s.executor.Execute(ctx, op, func(_ctx context.Context) error {
+		sh := s.shardFor(key)
+		sh.mu.Lock()
+		e, ok := sh.delete(key)
+		sh.mu.Unlock()
+
+		if ok {
+			s.stats.DeleteOp()
+			s.stats.AddItems(-1)
+			s.stats.AddMemory(-e.Size)
+		}
+		return nil
+	})
+}
+
+// DeleteMulti removes multiple keys from the store.
+func (s *Store) DeleteMulti(ctx context.Context, keys ...string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	if err := s.checkClosed("memory.delete_multi"); err != nil {
+		return err
+	}
+
+	op := contracts.Operation{
+		Name:     "delete_multi",
+		KeyCount: len(keys),
+		Backend:  "memory",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return s.executor.Execute(ctx, op, func(_ctx context.Context) error {
+		for _, key := range keys {
+			sh := s.shardFor(key)
+			sh.mu.Lock()
+			e, ok := sh.delete(key)
+			sh.mu.Unlock()
+
+			if ok {
+				s.stats.DeleteOp()
+				s.stats.AddItems(-1)
+				s.stats.AddMemory(-e.Size)
 			}
 		}
-		s.mu.RUnlock()
-	}
-	op.KeyCount = len(keys)
-	return keys, nil
+		return nil
+	})
 }
 
-// Size returns the number of entries currently in the cache.
-func (c *Cache) Size(ctx context.Context) (int64, error) {
-	if err := c.checkClosed("memory.size"); err != nil {
+// Exists reports whether a non-expired key exists in the store.
+func (s *Store) Exists(ctx context.Context, key string) (bool, error) {
+	if err := s.validateKey("memory.exists", key); err != nil {
+		return false, err
+	}
+	if err := s.checkClosed("memory.exists"); err != nil {
+		return false, err
+	}
+
+	op := contracts.Operation{
+		Name:    "exists",
+		Key:     key,
+		Backend: "memory",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return runtime.ExecuteTyped(s.executor, ctx, op, func(_ctx context.Context) (bool, error) {
+		sh := s.shardFor(key)
+		now := time.Now().UnixNano()
+
+		sh.mu.RLock()
+		e, ok := sh.get(key)
+		if ok && e.IsExpired(now) {
+			ok = false
+		}
+		sh.mu.RUnlock()
+
+		return ok, nil
+	})
+}
+
+// TTL returns the remaining time-to-live for the given key. If the key has
+// no expiration, a duration greater than 365 days is returned. Returns an
+// error if the key does not exist or has expired.
+func (s *Store) TTL(ctx context.Context, key string) (time.Duration, error) {
+	if err := s.validateKey("memory.ttl", key); err != nil {
 		return 0, err
 	}
-	op := observability.Op{Backend: "memory", Name: "size"}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	return c.stats.Items(), nil
-}
+	if err := s.checkClosed("memory.ttl"); err != nil {
+		return 0, err
+	}
 
-// Expire updates the TTL for an existing key.
-func (c *Cache) Expire(ctx context.Context, key string, ttl time.Duration) error {
-	if err := c.checkClosed("memory.expire"); err != nil {
-		return err
+	op := contracts.Operation{
+		Name:    "ttl",
+		Key:     key,
+		Backend: "memory",
 	}
-	op := observability.Op{Backend: "memory", Name: "expire", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	if ttl < 0 {
-		result.Err = cacheerrors.InvalidKey("memory.expire", key, errors.New("ttl cannot be negative"))
-		return result.Err
-	}
-	s := c.shardFor(key)
-	now := time.Now().UnixNano()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	e, ok := s.items[key]
-	if !ok || e.IsExpiredAt(now) {
-		result.Err = cacheerrors.NotFound("memory.expire", key)
-		return result.Err
-	}
-	newEntry := eviction.NewEntry(key, e.Value, ttl, 0)
-	newEntry.Hits = e.Hits
-	newEntry.Frequency = e.Frequency
-	s.size += newEntry.Size - e.Size
-	s.items[key] = newEntry
-	s.evict.OnDelete(key)
-	s.evict.OnAdd(key, newEntry)
-	c.stats.SetOp()
-	return nil
-}
 
-// Persist removes the TTL from a key, making it persist indefinitely.
-func (c *Cache) Persist(ctx context.Context, key string) error {
-	return c.Expire(ctx, key, 0)
-}
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return runtime.ExecuteTyped(
+		s.executor,
+		ctx,
+		op,
+		func(_ctx context.Context) (time.Duration, error) {
+			sh := s.shardFor(key)
+			now := time.Now().UnixNano()
 
-// Clear removes all entries from the cache and resets statistics.
-func (c *Cache) Clear(ctx context.Context) error {
-	if err := c.checkClosed("memory.clear"); err != nil {
-		return err
-	}
-	op := observability.Op{Backend: "memory", Name: "clear"}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	for _, s := range c.shards {
-		s.mu.Lock()
-		s.items = make(map[string]*eviction.Entry, 64)
-		s.evict.Reset()
-		s.size = 0
-		s.count = 0
-		s.mu.Unlock()
-	}
-	c.stats.Reset()
-	return nil
+			sh.mu.RLock()
+			e, ok := sh.get(key)
+			if !ok || e.IsExpired(now) {
+				sh.mu.RUnlock()
+				return 0, errors.Factory.NotFound("memory.ttl", key)
+			}
+			ttl := e.TTL(now)
+			sh.mu.RUnlock()
+
+			return ttl, nil
+		},
+	)
 }

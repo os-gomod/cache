@@ -3,275 +3,318 @@ package memory
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
-	"github.com/os-gomod/cache/memory/eviction"
-	"github.com/os-gomod/cache/observability"
+	"github.com/os-gomod/cache/v2/internal/contracts"
+	"github.com/os-gomod/cache/v2/internal/errors"
+	"github.com/os-gomod/cache/v2/internal/runtime"
 )
 
-// GetMulti retrieves values for multiple keys, returning a map of found entries.
-func (c *Cache) GetMulti(ctx context.Context, keys ...string) (map[string][]byte, error) {
-	if err := c.checkClosed("memory.get_multi"); err != nil {
-		return nil, err
-	}
-	op := observability.Op{Backend: "memory", Name: "get_multi", KeyCount: len(keys)}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	out := make(map[string][]byte, len(keys))
-	for _, k := range keys {
-		if v, err := c.Get(ctx, k); err == nil {
-			out[k] = v
-		}
-	}
-	return out, nil
-}
-
-// SetMulti stores multiple key-value pairs with the given TTL.
-func (c *Cache) SetMulti(ctx context.Context, items map[string][]byte, ttl time.Duration) error {
-	if err := c.checkClosed("memory.set_multi"); err != nil {
-		return err
-	}
-	op := observability.Op{Backend: "memory", Name: "set_multi", KeyCount: len(items)}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	for k, v := range items {
-		if err := c.Set(ctx, k, v, ttl); err != nil {
-			result.Err = fmt.Errorf("memory.set_multi key=%s: %w", k, err)
-			return result.Err
-		}
-	}
-	return nil
-}
-
-// DeleteMulti removes multiple keys from the cache.
-func (c *Cache) DeleteMulti(ctx context.Context, keys ...string) error {
-	if err := c.checkClosed("memory.delete_multi"); err != nil {
-		return err
-	}
-	op := observability.Op{Backend: "memory", Name: "delete_multi", KeyCount: len(keys)}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	for _, k := range keys {
-		if err := c.Delete(ctx, k); err != nil {
-			result.Err = err
-			return result.Err
-		}
-	}
-	return nil
-}
-
-// GetOrSet retrieves the value for key, or calls fn to compute, cache, and return it.
-func (c *Cache) GetOrSet(
-	ctx context.Context,
-	key string,
-	fn func() ([]byte, error),
-	ttl time.Duration,
-) ([]byte, error) {
-	if err := c.checkClosed("memory.get_or_set"); err != nil {
-		return nil, err
-	}
-	op := observability.Op{Backend: "memory", Name: "get_or_set", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	s := c.shardFor(key)
-	now := time.Now().UnixNano()
-	s.mu.RLock()
-	e, ok := s.items[key]
-	if ok && e.IsExpiredAt(now) {
-		ok = false
-	}
-	s.mu.RUnlock()
-	if ok {
-		result.Hit = true
-		result.ByteSize = len(e.Value)
-		e.Touch()
-		s.evict.OnAccess(key, e)
-		c.stats.Hit()
-		val, err := c.detector.Do(ctx, key, e.Value, e,
-			func(_ context.Context) ([]byte, error) {
-				return fn()
-			},
-			func(newVal []byte) {
-				_ = c.Set(ctx, key, newVal, ttl)
-			},
-		)
-		if err != nil {
-			return e.Value, nil
-		}
-		return val, nil
-	}
-	c.stats.Miss()
-	return c.sg.Do(ctx, key, func() ([]byte, error) {
-		if val, err := c.Get(ctx, key); err == nil {
-			result.Hit = true
-			result.ByteSize = len(val)
-			return val, nil
-		}
-		val, err := fn()
-		if err != nil {
-			result.Err = err
-			return nil, err
-		}
-		_ = c.Set(ctx, key, val, ttl)
-		result.ByteSize = len(val)
-		return val, nil
-	})
-}
-
-// GetSet sets the value for a key and returns the previous value.
-func (c *Cache) GetSet(
-	ctx context.Context,
-	key string,
-	value []byte,
-	ttl time.Duration,
-) ([]byte, error) {
-	if err := c.checkClosed("memory.getset"); err != nil {
-		return nil, err
-	}
-	op := observability.Op{Backend: "memory", Name: "getset", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	old, _ := c.Get(ctx, key)
-	if old != nil {
-		result.Hit = true
-		result.ByteSize = len(old)
-	}
-	_ = c.Set(ctx, key, value, ttl)
-	return old, nil
-}
-
-// CompareAndSwap atomically sets key to newVal if its current value equals oldVal.
-func (c *Cache) CompareAndSwap(
+// CompareAndSwap atomically replaces oldVal with newVal if the current value
+// for the key matches oldVal exactly. Returns true if the swap was performed.
+func (s *Store) CompareAndSwap(
 	ctx context.Context,
 	key string,
 	oldVal, newVal []byte,
 	ttl time.Duration,
 ) (bool, error) {
-	if err := c.checkClosed("memory.cas"); err != nil {
+	if err := s.validateKey("memory.cas", key); err != nil {
 		return false, err
 	}
-	op := observability.Op{Backend: "memory", Name: "cas", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	s := c.shardFor(key)
-	now := time.Now().UnixNano()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	e, ok := s.items[key]
-	if !ok || e.IsExpiredAt(now) {
-		return false, nil
+	if err := s.checkClosed("memory.cas"); err != nil {
+		return false, err
 	}
-	if !bytes.Equal(e.Value, oldVal) {
-		return false, nil
-	}
-	ne := eviction.NewEntry(key, newVal, ttl, 0)
-	s.size += ne.Size - e.Size
-	s.items[key] = ne
-	s.evict.OnAdd(key, ne)
-	c.stats.SetOp()
-	return true, nil
-}
 
-// Increment atomically adds delta to the integer value stored at key, returning the new value.
-func (c *Cache) Increment(ctx context.Context, key string, delta int64) (int64, error) {
-	if err := c.checkClosed("memory.increment"); err != nil {
-		return 0, err
+	effectiveTTL := s.resolveTTL(ttl)
+
+	op := contracts.Operation{
+		Name:    "compare_and_swap",
+		Key:     key,
+		Backend: "memory",
 	}
-	op := observability.Op{Backend: "memory", Name: "increment", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	s := c.shardFor(key)
-	now := time.Now().UnixNano()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var current int64
-	if e, ok := s.items[key]; ok && !e.IsExpiredAt(now) {
-		if v, err := strconv.ParseInt(string(e.Value), 10, 64); err == nil {
-			current = v
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return runtime.ExecuteTyped(s.executor, ctx, op, func(_ctx context.Context) (bool, error) {
+		sh := s.shardFor(key)
+		now := time.Now().UnixNano()
+
+		sh.mu.Lock()
+		e, ok := sh.get(key)
+		if !ok || e.IsExpired(now) {
+			sh.mu.Unlock()
+			return false, errors.Factory.NotFound("memory.cas", key)
 		}
-	}
-	current += delta
-	ne := eviction.NewEntry(key, []byte(strconv.FormatInt(current, 10)), 0, 0)
-	s.items[key] = ne
-	s.evict.OnAdd(key, ne)
-	c.stats.SetOp()
-	return current, nil
+		if !bytes.Equal(e.Value, oldVal) {
+			sh.mu.Unlock()
+			return false, nil
+		}
+
+		newEntry := NewEntry(key, newVal, effectiveTTL, now)
+		perShardMax := s.cfg.maxMemoryBytes / int64(len(s.shards))
+		sh.set(key, newEntry, perShardMax)
+		sh.mu.Unlock()
+
+		s.stats.SetOp()
+		return true, nil
+	})
 }
 
-// Decrement atomically subtracts delta from the integer value stored at key.
-func (c *Cache) Decrement(ctx context.Context, key string, delta int64) (int64, error) {
-	return c.Increment(ctx, key, -delta)
-}
-
-// SetNX sets the key-value pair only if the key does not already exist.
-func (c *Cache) SetNX(
+// SetNX sets a key-value pair only if the key does not already exist (or has
+// expired). Returns true if the key was set, false if it already existed.
+func (s *Store) SetNX(
 	ctx context.Context,
 	key string,
 	value []byte,
 	ttl time.Duration,
 ) (bool, error) {
-	if err := c.checkClosed("memory.setnx"); err != nil {
+	if err := s.validateKey("memory.setnx", key); err != nil {
 		return false, err
 	}
-	op := observability.Op{Backend: "memory", Name: "setnx", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	s := c.shardFor(key)
-	now := time.Now().UnixNano()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if e, ok := s.items[key]; ok && !e.IsExpiredAt(now) {
-		return false, nil
+	if err := s.checkClosed("memory.setnx"); err != nil {
+		return false, err
 	}
-	e := eviction.NewEntry(key, value, ttl, 0)
-	s.items[key] = e
-	s.size += e.Size
-	s.count++
-	s.evict.OnAdd(key, e)
-	c.stats.SetOp()
-	c.stats.AddMemory(e.Size)
-	c.stats.AddItems(1)
-	return true, nil
+
+	effectiveTTL := s.resolveTTL(ttl)
+
+	op := contracts.Operation{
+		Name:    "setnx",
+		Key:     key,
+		Backend: "memory",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return runtime.ExecuteTyped(s.executor, ctx, op, func(_ctx context.Context) (bool, error) {
+		sh := s.shardFor(key)
+		now := time.Now().UnixNano()
+
+		sh.mu.Lock()
+		e, ok := sh.get(key)
+		if ok && !e.IsExpired(now) {
+			sh.mu.Unlock()
+			return false, nil
+		}
+
+		newEntry := NewEntry(key, value, effectiveTTL, now)
+		perShardMax := s.cfg.maxMemoryBytes / int64(len(s.shards))
+		sh.set(key, newEntry, perShardMax)
+		sh.mu.Unlock()
+
+		s.stats.SetOp()
+		s.stats.AddItems(1)
+		s.stats.AddMemory(newEntry.Size)
+		return true, nil
+	})
 }
+
+// Increment atomically increments a numeric value by delta and returns the
+// new value. If the key does not exist, it is initialized to 0 before
+// incrementing. The stored value is converted to/from []byte using
+// strconv.FormatInt/ParseInt.
+func (s *Store) Increment(ctx context.Context, key string, delta int64) (int64, error) {
+	if err := s.validateKey("memory.increment", key); err != nil {
+		return 0, err
+	}
+	if err := s.checkClosed("memory.increment"); err != nil {
+		return 0, err
+	}
+
+	op := contracts.Operation{
+		Name:    "increment",
+		Key:     key,
+		Backend: "memory",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return runtime.ExecuteTyped(s.executor, ctx, op, func(_ctx context.Context) (int64, error) {
+		sh := s.shardFor(key)
+		now := time.Now().UnixNano()
+
+		sh.mu.Lock()
+		e, ok := sh.get(key)
+		var current int64
+		if ok && !e.IsExpired(now) {
+			current, _ = strconv.ParseInt(string(e.Value), 10, 64)
+		}
+		current += delta
+		newVal := []byte(strconv.FormatInt(current, 10))
+		newEntry := NewEntry(key, newVal, s.resolveTTL(0), now)
+		newEntry.Frequency = 1
+		perShardMax := s.cfg.maxMemoryBytes / int64(len(s.shards))
+		sh.set(key, newEntry, perShardMax)
+		sh.mu.Unlock()
+
+		s.stats.SetOp()
+		return current, nil
+	})
+}
+
+// Decrement atomically decrements a numeric value by delta and returns the
+// new value.
+func (s *Store) Decrement(ctx context.Context, key string, delta int64) (int64, error) {
+	return s.Increment(ctx, key, -delta)
+}
+
+// GetSet atomically sets a new value for the key and returns the previous
+// value. If the key did not exist, nil is returned for the old value.
+func (s *Store) GetSet(
+	ctx context.Context,
+	key string,
+	value []byte,
+	ttl time.Duration,
+) ([]byte, error) {
+	if err := s.validateKey("memory.getset", key); err != nil {
+		return nil, err
+	}
+	if err := s.checkClosed("memory.getset"); err != nil {
+		return nil, err
+	}
+
+	effectiveTTL := s.resolveTTL(ttl)
+
+	op := contracts.Operation{
+		Name:    "getset",
+		Key:     key,
+		Backend: "memory",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return runtime.ExecuteTyped(s.executor, ctx, op, func(_ctx context.Context) ([]byte, error) {
+		sh := s.shardFor(key)
+		now := time.Now().UnixNano()
+
+		sh.mu.Lock()
+		var oldVal []byte
+		e, ok := sh.get(key)
+		if ok && !e.IsExpired(now) {
+			oldVal = make([]byte, len(e.Value))
+			copy(oldVal, e.Value)
+		}
+
+		newEntry := NewEntry(key, value, effectiveTTL, now)
+		perShardMax := s.cfg.maxMemoryBytes / int64(len(s.shards))
+		sh.set(key, newEntry, perShardMax)
+		sh.mu.Unlock()
+
+		s.stats.SetOp()
+		return oldVal, nil
+	})
+}
+
+// Keys returns all non-expired keys in the store that match the given glob
+// pattern. An empty pattern matches all keys.
+func (s *Store) Keys(ctx context.Context, pattern string) ([]string, error) {
+	if err := s.checkClosed("memory.keys"); err != nil {
+		return nil, err
+	}
+
+	op := contracts.Operation{
+		Name:    "keys",
+		Backend: "memory",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return runtime.ExecuteTyped(s.executor, ctx, op, func(_ctx context.Context) ([]string, error) {
+		var allKeys []string
+		for _, sh := range s.shards {
+			sh.mu.RLock()
+			keys := sh.keys(pattern)
+			sh.mu.RUnlock()
+			allKeys = append(allKeys, keys...)
+		}
+		return allKeys, nil
+	})
+}
+
+// Clear removes all entries from all shards and resets statistics.
+func (s *Store) Clear(ctx context.Context) error {
+	if err := s.checkClosed("memory.clear"); err != nil {
+		return err
+	}
+
+	op := contracts.Operation{
+		Name:    "clear",
+		Backend: "memory",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return s.executor.Execute(ctx, op, func(_ctx context.Context) error {
+		for _, sh := range s.shards {
+			sh.mu.Lock()
+			sh.clear()
+			sh.mu.Unlock()
+		}
+		s.stats.Reset()
+		return nil
+	})
+}
+
+// Size returns the total number of non-expired entries across all shards.
+func (s *Store) Size(ctx context.Context) (int64, error) {
+	if err := s.checkClosed("memory.size"); err != nil {
+		return 0, err
+	}
+
+	op := contracts.Operation{
+		Name:    "size",
+		Backend: "memory",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return runtime.ExecuteTyped(s.executor, ctx, op, func(_ctx context.Context) (int64, error) {
+		var total int64
+		for _, sh := range s.shards {
+			sh.mu.RLock()
+			count, _ := sh.totalSize()
+			sh.mu.RUnlock()
+			total += count
+		}
+		return total, nil
+	})
+}
+
+// GetOrSet retrieves the value for the given key. If the key is missing or
+// expired, fn is called to produce the value, which is then stored with the
+// given TTL. The fn function is called at most once per key, even under
+// concurrent access (using sync.SingleFlight semantics).
+func (s *Store) GetOrSet(
+	ctx context.Context,
+	key string,
+	fn func() ([]byte, error),
+	ttl time.Duration,
+) ([]byte, error) {
+	// Try to get first
+	val, err := s.Get(ctx, key)
+	if err == nil {
+		return val, nil
+	}
+	if !errors.Factory.IsNotFound(err) {
+		return nil, err
+	}
+
+	// Key not found: call fn and set
+	val, err = fn()
+	if err != nil {
+		return nil, err
+	}
+
+	setErr := s.Set(ctx, key, val, ttl)
+	if setErr != nil {
+		return nil, setErr
+	}
+	return val, nil
+}
+
+// Ensure Store implements contracts.Cache at compile time.
+var (
+	_ contracts.Reader        = (*Store)(nil)
+	_ contracts.Writer        = (*Store)(nil)
+	_ contracts.AtomicOps     = (*Store)(nil)
+	_ contracts.Scanner       = (*Store)(nil)
+	_ contracts.Lifecycle     = (*Store)(nil)
+	_ contracts.StatsProvider = (*Store)(nil)
+	// Suppress unused import warnings.
+	_ = sync.Mutex{}
+	_ = bytes.Equal
+)

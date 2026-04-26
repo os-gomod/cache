@@ -1,98 +1,98 @@
 services:
-  # redis:
-  #   image: redis:7-alpine
-  #   container_name: go_cache_redis_dev
-  #   restart: unless-stopped
-  #   ports:
-  #     - '6379:6379'
-  #   command:
-  #     - redis-server
-  #     - --save
-  #     - ''
-  #     - --appendonly
-  #     - no
-  #     - --maxmemory
-  #     - 256mb
-  #     - --maxmemory-policy
-  #     - allkeys-lru
-  #     - --loglevel
-  #     - verbose
-  #   volumes:
-  #     - go_cache_redis_data:/data
-  #   healthcheck:
-  #     test: ['CMD', 'redis-cli', 'ping']
-  #     interval: 2s
-  #     timeout: 1s
-  #     retries: 5
-
-
-  redis-cluster-node1:
+  redis:
     image: redis:7-alpine
-    container_name: redis_cluster_node1
-    command: redis-server --port 6379 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_cluster_data1:/data
-    networks:
-      - redis-cluster
-
-  redis-cluster-node2:
-    image: redis:7-alpine
-    container_name: redis_cluster_node2
-    command: redis-server --port 6380 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
-    ports:
-      - "6380:6380"
-    volumes:
-      - redis_cluster_data2:/data
-    networks:
-      - redis-cluster
-
-  redis-cluster-node3:
-    image: redis:7-alpine
-    container_name: redis_cluster_node3
-    command: redis-server --port 6381 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
-    ports:
-      - "6381:6381"
-    volumes:
-      - redis_cluster_data3:/data
-    networks:
-      - redis-cluster
-
-  redis-cluster-init:
-    image: redis:7-alpine
-    container_name: redis_cluster_init
-    depends_on:
-      - redis-cluster-node1
-      - redis-cluster-node2
-      - redis-cluster-node3
-    command: >
-      sh -c "echo 'yes' | redis-cli --cluster create
-      redis-cluster-node1:6379
-      redis-cluster-node2:6380
-      redis-cluster-node3:6381
-      --cluster-replicas 0"
-    networks:
-      - redis-cluster
-
-  redis-commander:
-    image: rediscommander/redis-commander:latest
-    container_name: go_cache_redis_commander_dev
+    container_name: go_cache_redis_dev
     restart: unless-stopped
-    environment:
-      - REDIS_HOSTS=local:redis-cluster-node1:6379
     ports:
-      - '8081:8081'
-    depends_on:
-      - redis-cluster-node1
+      - '6379:6379'
+    command:
+      - redis-server
+      - --save
+      - ''
+      - --appendonly
+      - no
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --loglevel
+      - verbose
+    volumes:
+      - go_cache_redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 1s
+      retries: 5
 
-networks:
-  redis-cluster:
-    driver: bridge
+
+#   redis-cluster-node1:
+#     image: redis:7-alpine
+#     container_name: redis_cluster_node1
+#     command: redis-server --port 6379 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+#     ports:
+#       - "6379:6379"
+#     volumes:
+#       - redis_cluster_data1:/data
+#     networks:
+#       - redis-cluster
+
+#   redis-cluster-node2:
+#     image: redis:7-alpine
+#     container_name: redis_cluster_node2
+#     command: redis-server --port 6380 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+#     ports:
+#       - "6380:6380"
+#     volumes:
+#       - redis_cluster_data2:/data
+#     networks:
+#       - redis-cluster
+
+#   redis-cluster-node3:
+#     image: redis:7-alpine
+#     container_name: redis_cluster_node3
+#     command: redis-server --port 6381 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+#     ports:
+#       - "6381:6381"
+#     volumes:
+#       - redis_cluster_data3:/data
+#     networks:
+#       - redis-cluster
+
+#   redis-cluster-init:
+#     image: redis:7-alpine
+#     container_name: redis_cluster_init
+#     depends_on:
+#       - redis-cluster-node1
+#       - redis-cluster-node2
+#       - redis-cluster-node3
+#     command: >
+#       sh -c "echo 'yes' | redis-cli --cluster create
+#       redis-cluster-node1:6379
+#       redis-cluster-node2:6380
+#       redis-cluster-node3:6381
+#       --cluster-replicas 0"
+#     networks:
+#       - redis-cluster
+
+#   redis-commander:
+#     image: rediscommander/redis-commander:latest
+#     container_name: go_cache_redis_commander_dev
+#     restart: unless-stopped
+#     environment:
+#       - REDIS_HOSTS=local:redis-cluster-node1:6379
+#     ports:
+#       - '8081:8081'
+#     depends_on:
+#       - redis-cluster-node1
+
+# networks:
+#   redis-cluster:
+#     driver: bridge
 
 volumes:
-  redis_cluster_data1:
-  redis_cluster_data2:
-  redis_cluster_data3:
-  # go_cache_redis_data:
-  #   name: go_cache_redis_data
+  # redis_cluster_data1:
+  # redis_cluster_data2:
+  # redis_cluster_data3:
+  go_cache_redis_data:
+    name: go_cache_redis_data

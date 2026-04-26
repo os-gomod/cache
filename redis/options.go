@@ -1,125 +1,105 @@
+// Package redis implements a Redis-backed cache store using go-redis/v9.
+// It provides the full Cache interface with support for key prefixing,
+// connection pooling, and Lua script-based atomic operations.
 package redis
 
 import (
 	"time"
 
-	"github.com/os-gomod/cache/config"
-	"github.com/os-gomod/cache/observability"
+	"github.com/os-gomod/cache/v2/internal/middleware"
 )
 
-// Option is a functional option for configuring a Redis cache.
-type Option func(*config.Redis)
+// Option is a functional option for configuring the Redis Store.
+type Option func(*config)
 
-// WithAddress sets the Redis server address (host:port or comma-separated for cluster).
-func WithAddress(addr string) Option { return func(c *config.Redis) { c.Addr = addr } }
-
-// WithUsername sets the Redis ACL username.
-func WithUsername(u string) Option { return func(c *config.Redis) { c.Username = u } }
-
-// WithPassword sets the Redis password.
-func WithPassword(p string) Option { return func(c *config.Redis) { c.Password = p } }
-
-// WithDB sets the Redis database index.
-func WithDB(db int) Option { return func(c *config.Redis) { c.DB = db } }
-
-// WithPoolSize sets the maximum number of socket connections.
-func WithPoolSize(n int) Option { return func(c *config.Redis) { c.PoolSize = n } }
-
-// WithMinIdleConns sets the minimum number of idle connections.
-func WithMinIdleConns(n int) Option {
-	return func(c *config.Redis) { c.MinIdleConns = n }
+// WithAddress sets the Redis server address in the format "host:port".
+// Default: "localhost:6379".
+func WithAddress(addrs ...string) Option {
+	return func(c *config) { c.addresses = addrs }
 }
 
-// WithMaxRetries sets the maximum number of command retries.
-func WithMaxRetries(n int) Option { return func(c *config.Redis) { c.MaxRetries = n } }
-
-// WithRetryBackoff sets the duration between retry attempts.
-func WithRetryBackoff(d time.Duration) Option {
-	return func(c *config.Redis) { c.RetryBackoff = d }
+// WithPassword sets the password for Redis AUTH. Default: "" (no auth).
+func WithPassword(pwd string) Option {
+	return func(c *config) { c.password = pwd }
 }
 
-// WithTTL sets the default time-to-live for Redis entries.
-func WithTTL(ttl time.Duration) Option {
-	return func(c *config.Redis) { c.DefaultTTL = ttl }
+// WithDB sets the Redis database index. Default: 0.
+func WithDB(db int) Option {
+	return func(c *config) { c.db = db }
 }
 
-// WithKeyPrefix sets a prefix prepended to all Redis keys.
+// WithPoolSize sets the maximum number of socket connections in the pool.
+// Default: 10 * GOMAXPROCS.
+func WithPoolSize(n int) Option {
+	return func(c *config) { c.poolSize = n }
+}
+
+// WithKeyPrefix sets a prefix prepended to all keys in Redis.
+// This allows multiple cache instances to share the same Redis cluster.
+// Default: "" (no prefix).
 func WithKeyPrefix(prefix string) Option {
-	return func(c *config.Redis) { c.KeyPrefix = prefix }
+	return func(c *config) { c.keyPrefix = prefix }
 }
 
-// WithEnableMetrics enables or disables internal metrics collection.
-func WithEnableMetrics(e bool) Option {
-	return func(c *config.Redis) { c.EnableMetrics = e }
+// WithTTL sets the default time-to-live for entries. Default: 5 minutes.
+func WithTTL(d time.Duration) Option {
+	return func(c *config) { c.defaultTTL = d }
 }
 
-// WithEnablePipeline enables or disables Redis pipelining for batch operations.
-func WithEnablePipeline(e bool) Option {
-	return func(c *config.Redis) { c.EnablePipeline = e }
+// WithDialTimeout sets the timeout for establishing a new connection.
+// Default: 5 seconds.
+func WithDialTimeout(d time.Duration) Option {
+	return func(c *config) { c.dialTimeout = d }
 }
 
-// WithDialTimeout sets the timeout for establishing new connections.
-func WithDialTimeout(d time.Duration) Option { return func(c *config.Redis) { c.DialTimeout = d } }
+// WithReadTimeout sets the timeout for socket reads. Default: 3 seconds.
+func WithReadTimeout(d time.Duration) Option {
+	return func(c *config) { c.readTimeout = d }
+}
 
-// WithReadTimeout sets the timeout for reading from Redis.
-func WithReadTimeout(d time.Duration) Option { return func(c *config.Redis) { c.ReadTimeout = d } }
-
-// WithWriteTimeout sets the timeout for writing to Redis.
+// WithWriteTimeout sets the timeout for socket writes. Default: 3 seconds.
 func WithWriteTimeout(d time.Duration) Option {
-	return func(c *config.Redis) { c.WriteTimeout = d }
+	return func(c *config) { c.writeTimeout = d }
 }
 
-// WithTimeouts sets dial, read, and write timeouts at once.
-func WithTimeouts(dial, read, write time.Duration) Option {
-	return func(c *config.Redis) {
-		c.DialTimeout = dial
-		c.ReadTimeout = read
-		c.WriteTimeout = write
+// WithInterceptors sets the observability interceptors for the Redis store.
+func WithInterceptors(i ...middleware.Interceptor) Option {
+	return func(c *config) { c.interceptors = i }
+}
+
+// config holds the validated configuration for the Redis Store.
+type config struct {
+	addresses    []string
+	password     string
+	db           int
+	poolSize     int
+	keyPrefix    string
+	defaultTTL   time.Duration
+	dialTimeout  time.Duration
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+	interceptors []middleware.Interceptor
+}
+
+// defaultConfig returns the default Redis configuration.
+func defaultConfig() config {
+	return config{
+		addresses:    []string{"localhost:6379"},
+		password:     "",
+		db:           0,
+		poolSize:     0, // 0 means use go-redis default
+		keyPrefix:    "",
+		defaultTTL:   5 * time.Minute,
+		dialTimeout:  5 * time.Second,
+		readTimeout:  3 * time.Second,
+		writeTimeout: 3 * time.Second,
 	}
 }
 
-// WithDistributedStampedeProtection enables or disables distributed stampede protection.
-func WithDistributedStampedeProtection(e bool) Option {
-	return func(c *config.Redis) { c.EnableDistributedStampedeProtection = e }
-}
-
-// WithStampedeLockTTL sets the TTL for stampede protection locks.
-func WithStampedeLockTTL(d time.Duration) Option {
-	return func(c *config.Redis) { c.StampedeLockTTL = d }
-}
-
-// WithStampedeWaitTimeout sets the maximum wait time for a stampede lock.
-func WithStampedeWaitTimeout(d time.Duration) Option {
-	return func(c *config.Redis) { c.StampedeWaitTimeout = d }
-}
-
-// WithStampedeRetryInterval sets the polling interval while waiting for a stampede lock.
-func WithStampedeRetryInterval(d time.Duration) Option {
-	return func(c *config.Redis) { c.StampedeRetryInterval = d }
-}
-
-// WithConfig applies a pre-built Redis configuration (cloned to prevent mutation).
-func WithConfig(cfg *config.Redis) Option {
-	if cfg == nil {
-		return func(*config.Redis) {}
-	}
-	cloned := cfg.Clone()
-	return func(c *config.Redis) { *c = *cloned }
-}
-
-// MergeOptions applies all options to a default Redis config and validates it.
-func MergeOptions(opts ...Option) (*config.Redis, error) {
-	cfg := config.DefaultRedis()
+// apply applies all options to the default config.
+func (c *config) apply(opts ...Option) {
+	*c = defaultConfig()
 	for _, opt := range opts {
-		opt(cfg)
+		opt(c)
 	}
-	if err := config.Apply(cfg); err != nil {
-		return nil, err
-	}
-	return cfg, nil
-}
-
-// WithInterceptors sets the observability interceptors for the Redis cache.
-func WithInterceptors(interceptors ...observability.Interceptor) Option {
-	return func(c *config.Redis) { c.Interceptors = interceptors }
 }

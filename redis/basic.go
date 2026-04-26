@@ -3,304 +3,379 @@ package redis
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
-	goredis "github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9"
 
-	cacheerrors "github.com/os-gomod/cache/errors"
-	"github.com/os-gomod/cache/observability"
+	"github.com/os-gomod/cache/v2/internal/contracts"
+	cacheerrors "github.com/os-gomod/cache/v2/internal/errors"
+	"github.com/os-gomod/cache/v2/internal/keyutil"
+	"github.com/os-gomod/cache/v2/internal/runtime"
 )
 
 // Get retrieves the value for the given key from Redis.
-func (c *Cache) Get(ctx context.Context, key string) ([]byte, error) {
-	if err := c.checkClosed("redis.get"); err != nil {
+// Returns errors.NotFound if the key does not exist.
+func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
+	if err := s.checkClosed("redis.get"); err != nil {
 		return nil, err
 	}
-	op := observability.Op{Backend: "redis", Name: "get", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	c.stats.RecordGet()
-	val, err := c.client.Get(ctx, c.buildKey(key)).Bytes()
-	if errors.Is(err, goredis.Nil) {
-		c.stats.Miss()
-		return nil, cacheerrors.NotFound("redis.get", key)
+
+	op := contracts.Operation{
+		Name:    "get",
+		Key:     key,
+		Backend: "redis",
 	}
-	if err != nil {
-		c.stats.ErrorOp()
-		result.Err = err
-		return nil, cacheerrors.WrapKey("redis.get", key, err)
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return runtime.ExecuteTyped(s.executor, ctx, op, func(ctx context.Context) ([]byte, error) {
+		rk := s.buildKey(key)
+		result, err := s.client.Get(ctx, rk).Bytes()
+		if err != nil {
+			if errors.Is(err, redis.Nil) {
+				s.stats.Miss()
+				return nil, cacheerrors.Factory.NotFound("redis.get", key)
+			}
+			s.stats.ErrorOp()
+			return nil, cacheerrors.Factory.Connection("redis.get", err)
+		}
+		s.stats.Hit()
+		return result, nil
+	})
+}
+
+// GetMulti retrieves multiple values by key. Missing keys are omitted from
+// the returned map.
+func (s *Store) GetMulti(ctx context.Context, keys ...string) (map[string][]byte, error) {
+	if len(keys) == 0 {
+		return make(map[string][]byte), nil
 	}
-	c.stats.Hit()
-	result.Hit = true
-	result.ByteSize = len(val)
-	return val, nil
+	if err := s.checkClosed("redis.get_multi"); err != nil {
+		return nil, err
+	}
+
+	op := contracts.Operation{
+		Name:     "get_multi",
+		KeyCount: len(keys),
+		Backend:  "redis",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return runtime.ExecuteTyped(s.executor, ctx, op, func(ctx context.Context) (map[string][]byte, error) {
+		// Build piped commands for all keys
+		pipes := make(map[string]string, len(keys))
+		for _, key := range keys {
+			pipes[s.buildKey(key)] = key
+		}
+
+		pipe := s.client.Pipeline()
+		cmds := make(map[string]*redis.StringCmd, len(pipes))
+		for rk := range pipes {
+			cmds[rk] = pipe.Get(ctx, rk)
+		}
+
+		_, err := pipe.Exec(ctx)
+		if err != nil && !errors.Is(err, redis.Nil) {
+			s.stats.ErrorOp()
+			return nil, cacheerrors.Factory.Connection("redis.get_multi", err)
+		}
+
+		result := make(map[string][]byte, len(keys))
+		for rk, origKey := range pipes {
+			val, cmdErr := cmds[rk].Bytes()
+			if cmdErr != nil {
+				if !errors.Is(cmdErr, redis.Nil) {
+					s.stats.ErrorOp()
+				}
+				s.stats.Miss()
+				continue
+			}
+			result[origKey] = val
+			s.stats.Hit()
+		}
+		return result, nil
+	})
 }
 
 // Set stores a key-value pair with the given TTL in Redis.
-func (c *Cache) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
-	if err := c.checkClosed("redis.set"); err != nil {
+func (s *Store) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	if err := s.checkClosed("redis.set"); err != nil {
 		return err
 	}
-	op := observability.Op{Backend: "redis", Name: "set", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	if ttl < 0 {
-		ttl = c.cfg.DefaultTTL
+
+	effectiveTTL := s.resolveTTL(ttl)
+
+	op := contracts.Operation{
+		Name:    "set",
+		Key:     key,
+		Backend: "redis",
 	}
-	if err := c.client.Set(ctx, c.buildKey(key), value, ttl).Err(); err != nil {
-		c.stats.ErrorOp()
-		result.Err = err
-		return cacheerrors.WrapKey("redis.set", key, err)
-	}
-	c.stats.SetOp()
-	return nil
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return s.executor.Execute(ctx, op, func(ctx context.Context) error {
+		rk := s.buildKey(key)
+		if err := s.client.Set(ctx, rk, value, effectiveTTL).Err(); err != nil {
+			s.stats.ErrorOp()
+			return cacheerrors.Factory.Connection("redis.set", err)
+		}
+		s.stats.SetOp()
+		return nil
+	})
 }
 
-// Delete removes a key from Redis.
-func (c *Cache) Delete(ctx context.Context, key string) error {
-	if err := c.checkClosed("redis.delete"); err != nil {
+// SetMulti stores multiple key-value pairs with the given TTL using a
+// Redis pipeline for efficiency.
+func (s *Store) SetMulti(ctx context.Context, items map[string][]byte, ttl time.Duration) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if err := s.checkClosed("redis.set_multi"); err != nil {
 		return err
 	}
-	op := observability.Op{Backend: "redis", Name: "delete", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	if err := c.client.Del(ctx, c.buildKey(key)).Err(); err != nil {
-		c.stats.ErrorOp()
-		result.Err = err
-		return cacheerrors.WrapKey("redis.delete", key, err)
+
+	effectiveTTL := s.resolveTTL(ttl)
+
+	op := contracts.Operation{
+		Name:     "set_multi",
+		KeyCount: len(items),
+		Backend:  "redis",
 	}
-	c.stats.DeleteOp()
-	return nil
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return s.executor.Execute(ctx, op, func(ctx context.Context) error {
+		pipe := s.client.Pipeline()
+		for key, value := range items {
+			rk := s.buildKey(key)
+			pipe.Set(ctx, rk, value, effectiveTTL)
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			s.stats.ErrorOp()
+			return cacheerrors.Factory.Connection("redis.set_multi", err)
+		}
+		s.stats.SetOp()
+		return nil
+	})
 }
 
-// Exists reports whether the key exists in Redis.
-func (c *Cache) Exists(ctx context.Context, key string) (bool, error) {
-	if err := c.checkClosed("redis.exists"); err != nil {
+// Delete removes a key from Redis. Deleting a non-existent key is a no-op.
+func (s *Store) Delete(ctx context.Context, key string) error {
+	if err := s.checkClosed("redis.delete"); err != nil {
+		return err
+	}
+
+	op := contracts.Operation{
+		Name:    "delete",
+		Key:     key,
+		Backend: "redis",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return s.executor.Execute(ctx, op, func(ctx context.Context) error {
+		rk := s.buildKey(key)
+		if err := s.client.Del(ctx, rk).Err(); err != nil {
+			s.stats.ErrorOp()
+			return cacheerrors.Factory.Connection("redis.delete", err)
+		}
+		s.stats.DeleteOp()
+		return nil
+	})
+}
+
+// DeleteMulti removes multiple keys from Redis using a pipeline.
+func (s *Store) DeleteMulti(ctx context.Context, keys ...string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	if err := s.checkClosed("redis.delete_multi"); err != nil {
+		return err
+	}
+
+	op := contracts.Operation{
+		Name:     "delete_multi",
+		KeyCount: len(keys),
+		Backend:  "redis",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return s.executor.Execute(ctx, op, func(ctx context.Context) error {
+		rks := make([]string, len(keys))
+		for i, key := range keys {
+			rks[i] = s.buildKey(key)
+		}
+		if err := s.client.Del(ctx, rks...).Err(); err != nil {
+			s.stats.ErrorOp()
+			return cacheerrors.Factory.Connection("redis.delete_multi", err)
+		}
+		s.stats.DeleteOp()
+		return nil
+	})
+}
+
+// Exists reports whether a key exists in Redis.
+func (s *Store) Exists(ctx context.Context, key string) (bool, error) {
+	if err := s.checkClosed("redis.exists"); err != nil {
 		return false, err
 	}
-	op := observability.Op{Backend: "redis", Name: "exists", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	n, err := c.client.Exists(ctx, c.buildKey(key)).Result()
-	if err != nil {
-		c.stats.ErrorOp()
-		result.Err = err
-		return false, cacheerrors.WrapKey("redis.exists", key, err)
+
+	op := contracts.Operation{
+		Name:    "exists",
+		Key:     key,
+		Backend: "redis",
 	}
-	result.Hit = n > 0
-	return n > 0, nil
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return runtime.ExecuteTyped(s.executor, ctx, op, func(ctx context.Context) (bool, error) {
+		rk := s.buildKey(key)
+		n, err := s.client.Exists(ctx, rk).Result()
+		if err != nil {
+			s.stats.ErrorOp()
+			return false, cacheerrors.Factory.Connection("redis.exists", err)
+		}
+		return n > 0, nil
+	})
 }
 
-// TTL returns the remaining time-to-live for the given key.
-func (c *Cache) TTL(ctx context.Context, key string) (time.Duration, error) {
-	if err := c.checkClosed("redis.ttl"); err != nil {
+// TTL returns the remaining time-to-live for the given key in Redis.
+func (s *Store) TTL(ctx context.Context, key string) (time.Duration, error) {
+	if err := s.checkClosed("redis.ttl"); err != nil {
 		return 0, err
 	}
-	op := observability.Op{Backend: "redis", Name: "ttl", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	d, err := c.client.TTL(ctx, c.buildKey(key)).Result()
-	if err != nil {
-		result.Err = err
-		return 0, cacheerrors.WrapKey("redis.ttl", key, err)
+
+	op := contracts.Operation{
+		Name:    "ttl",
+		Key:     key,
+		Backend: "redis",
 	}
-	if d == time.Duration(-2) || d == -2*time.Second {
-		return 0, cacheerrors.NotFound("redis.ttl", key)
-	}
-	if d == time.Duration(-1) || d == -1*time.Second {
-		return -1 * time.Second, nil
-	}
-	return d, nil
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return runtime.ExecuteTyped(s.executor, ctx, op, func(ctx context.Context) (time.Duration, error) {
+		rk := s.buildKey(key)
+		dur, err := s.client.TTL(ctx, rk).Result()
+		if err != nil {
+			s.stats.ErrorOp()
+			return 0, cacheerrors.Factory.Connection("redis.ttl", err)
+		}
+		if dur < 0 {
+			// -1 = no expiry, -2 = key doesn't exist
+			return 0, cacheerrors.Factory.NotFound("redis.ttl", key)
+		}
+		return dur, nil
+	})
 }
 
-// Ping checks whether the Redis server is reachable.
-func (c *Cache) Ping(ctx context.Context) error {
-	if err := c.checkClosed("redis.ping"); err != nil {
-		return err
-	}
-	op := observability.Op{Backend: "redis", Name: "ping"}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	if err := c.client.Ping(ctx).Err(); err != nil {
-		result.Err = err
-		return err
-	}
-	return nil
-}
-
-// Keys returns all keys matching the given pattern, with the key prefix stripped.
-func (c *Cache) Keys(ctx context.Context, pattern string) ([]string, error) {
-	if err := c.checkClosed("redis.keys"); err != nil {
+// Keys returns all keys matching the given pattern using the SCAN command.
+func (s *Store) Keys(ctx context.Context, pattern string) ([]string, error) {
+	if err := s.checkClosed("redis.keys"); err != nil {
 		return nil, err
 	}
-	op := observability.Op{Backend: "redis", Name: "keys"}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	fullPattern := c.buildKey(pattern)
-	keys, err := c.client.Keys(ctx, fullPattern).Result()
-	if err != nil {
-		result.Err = err
-		return nil, cacheerrors.Wrap("redis.keys", err)
-	}
-	out := make([]string, len(keys))
-	for i, k := range keys {
-		out[i] = c.stripPrefix(k)
-	}
-	return out, nil
-}
 
-// Size returns the approximate number of keys in the cache's key namespace.
-func (c *Cache) Size(ctx context.Context) (int64, error) {
-	if err := c.checkClosed("redis.size"); err != nil {
-		return 0, err
+	op := contracts.Operation{
+		Name:    "keys",
+		Backend: "redis",
 	}
-	op := observability.Op{Backend: "redis", Name: "size"}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	pattern := c.buildKey("*")
-	var (
-		count  int64
-		cursor uint64
-	)
-	for {
-		keys, next, err := c.client.Scan(ctx, cursor, pattern, 100).Result()
-		if err != nil {
-			result.Err = err
-			return 0, cacheerrors.Wrap("redis.size", err)
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return runtime.ExecuteTyped(s.executor, ctx, op, func(ctx context.Context) ([]string, error) {
+		scanPattern := s.buildKey(pattern)
+		if pattern == "" {
+			scanPattern = s.cfg.keyPrefix + "*"
 		}
-		count += int64(len(keys))
-		cursor = next
-		if cursor == 0 {
-			return count, nil
-		}
-	}
-}
+		var allKeys []string
+		var cursor uint64
 
-// Expire updates the TTL for an existing key.
-func (c *Cache) Expire(ctx context.Context, key string, ttl time.Duration) error {
-	if err := c.checkClosed("redis.expire"); err != nil {
-		return err
-	}
-	op := observability.Op{Backend: "redis", Name: "expire", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	if err := c.client.Expire(ctx, c.buildKey(key), ttl).Err(); err != nil {
-		result.Err = err
-		return err
-	}
-	return nil
-}
-
-// Persist removes the TTL from a key, making it persist indefinitely.
-func (c *Cache) Persist(ctx context.Context, key string) error {
-	if err := c.checkClosed("redis.persist"); err != nil {
-		return err
-	}
-	op := observability.Op{Backend: "redis", Name: "persist", Key: key}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	if err := c.client.Persist(ctx, c.buildKey(key)).Err(); err != nil {
-		result.Err = err
-		return err
-	}
-	return nil
-}
-
-// Clear removes all keys in the cache's key namespace from Redis.
-func (c *Cache) Clear(ctx context.Context) error {
-	if err := c.checkClosed("redis.clear"); err != nil {
-		return err
-	}
-	op := observability.Op{Backend: "redis", Name: "clear"}
-	start := time.Now()
-	ctx = c.chain.Before(ctx, op)
-	var result observability.Result
-	defer func() {
-		result.Latency = time.Since(start)
-		c.chain.After(ctx, op, result)
-	}()
-	pattern := c.buildKey("*")
-	for {
-		var (
-			toDelete []string
-			cursor   uint64
-		)
 		for {
-			keys, next, err := c.client.Scan(ctx, cursor, pattern, 100).Result()
+			var keys []string
+			var err error
+			keys, cursor, err = s.client.Scan(ctx, cursor, scanPattern, 100).Result()
 			if err != nil {
-				result.Err = err
-				return cacheerrors.Wrap("redis.clear", err)
+				s.stats.ErrorOp()
+				return nil, cacheerrors.Factory.Connection("redis.keys", err)
 			}
-			toDelete = append(toDelete, keys...)
-			cursor = next
+			for _, k := range keys {
+				// Strip prefix from returned keys
+				allKeys = append(allKeys, keyutil.StripPrefix(s.cfg.keyPrefix, k))
+			}
 			if cursor == 0 {
 				break
 			}
 		}
-		if len(toDelete) == 0 {
-			break
-		}
-		const batchSize = 100
-		for start := 0; start < len(toDelete); start += batchSize {
-			end := start + batchSize
-			if end > len(toDelete) {
-				end = len(toDelete)
-			}
-			if err := c.client.Del(ctx, toDelete[start:end]...).Err(); err != nil {
-				result.Err = err
-				return cacheerrors.Wrap("redis.clear", err)
-			}
-		}
-	}
-	return nil
+		return allKeys, nil
+	})
 }
+
+// Clear removes all keys with the configured prefix from Redis using SCAN+DEL.
+func (s *Store) Clear(ctx context.Context) error {
+	if err := s.checkClosed("redis.clear"); err != nil {
+		return err
+	}
+
+	op := contracts.Operation{
+		Name:    "clear",
+		Backend: "redis",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return s.executor.Execute(ctx, op, func(ctx context.Context) error {
+		pattern := s.cfg.keyPrefix + "*"
+		var cursor uint64
+
+		for {
+			var keys []string
+			var err error
+			keys, cursor, err = s.client.Scan(ctx, cursor, pattern, 100).Result()
+			if err != nil {
+				s.stats.ErrorOp()
+				return cacheerrors.Factory.Connection("redis.clear", err)
+			}
+			if len(keys) > 0 {
+				if delErr := s.client.Del(ctx, keys...).Err(); delErr != nil {
+					s.stats.ErrorOp()
+					return cacheerrors.Factory.Connection("redis.clear", delErr)
+				}
+			}
+			if cursor == 0 {
+				break
+			}
+		}
+		s.stats.Reset()
+		return nil
+	})
+}
+
+// Size returns the approximate number of keys with the configured prefix
+// using SCAN to count them.
+func (s *Store) Size(ctx context.Context) (int64, error) {
+	if err := s.checkClosed("redis.size"); err != nil {
+		return 0, err
+	}
+
+	op := contracts.Operation{
+		Name:    "size",
+		Backend: "redis",
+	}
+
+	//nolint:wrapcheck // error is already wrapped by internal packages
+	return runtime.ExecuteTyped(s.executor, ctx, op, func(ctx context.Context) (int64, error) {
+		pattern := s.cfg.keyPrefix + "*"
+		var count int64
+		var cursor uint64
+
+		for {
+			var keys []string
+			var err error
+			keys, cursor, err = s.client.Scan(ctx, cursor, pattern, 1000).Result()
+			if err != nil {
+				s.stats.ErrorOp()
+				return 0, cacheerrors.Factory.Connection("redis.size", err)
+			}
+			count += int64(len(keys))
+			if cursor == 0 {
+				break
+			}
+		}
+		return count, nil
+	})
+}
+
+// Suppress unused import.
+var _ = fmt.Sprint

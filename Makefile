@@ -162,7 +162,6 @@ fmt:
 	@$(GO) fmt ./...
 	@command -v gofumpt >/dev/null 2>&1 && gofumpt -w . || true
 	@command -v goimports >/dev/null 2>&1 && goimports -w . || true
-	@command -v golines >/dev/null 2>&1 && golines -w . || true
 	@echo "    formatting complete. ✅"
 
 vet:
