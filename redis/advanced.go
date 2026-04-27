@@ -15,7 +15,8 @@ import (
 )
 
 // CompareAndSwap atomically replaces oldVal with newVal if the current value
-// matches oldVal exactly. Uses a Lua script for atomicity.
+// matches oldVal exactly. Uses a Lua script for atomicity. Returns NotFound error
+// if the key doesn't exist, or InvalidConfig error if the value doesn't match.
 func (s *Store) CompareAndSwap(ctx context.Context, key string, oldVal, newVal []byte, ttl time.Duration) (bool, error) {
 	if err := s.checkClosed("redis.cas"); err != nil {
 		return false, err
@@ -39,11 +40,20 @@ func (s *Store) CompareAndSwap(ctx context.Context, key string, oldVal, newVal [
 			s.stats.ErrorOp()
 			return false, cacheerrors.Factory.Connection("redis.cas", err)
 		}
-		if result == 0 {
-			return false, cacheerrors.Factory.InvalidConfig("redis.cas", "value mismatch or key not found")
+
+		if result == 1 {
+			s.stats.SetOp()
+			return true, nil
 		}
-		s.stats.SetOp()
-		return true, nil
+
+		// Distinguish between "key not found" and "value mismatch"
+		if result == -1 {
+			// Key doesn't exist
+			return false, cacheerrors.Factory.NotFound("redis.cas", key)
+		}
+
+		// result == 0: value mismatch
+		return false, cacheerrors.Factory.InvalidConfig("redis.cas", "value mismatch")
 	})
 }
 

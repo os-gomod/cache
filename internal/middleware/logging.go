@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/os-gomod/cache/v2/internal/contracts"
+	cacheerrors "github.com/os-gomod/cache/v2/internal/errors"
 )
 
 // LogEntry represents a single structured log entry for a cache operation.
@@ -34,7 +35,8 @@ type Logger interface {
 
 // LoggingMiddleware returns a Middleware that logs each cache operation
 // using the provided Logger. The log entry includes the operation name,
-// backend, key, latency, and any error.
+// backend, key, latency, and any error. NotFound errors (cache misses) are
+// not logged as they are expected and normal.
 func LoggingMiddleware(logger Logger) Middleware {
 	return func(next Handler) Handler {
 		return func(ctx context.Context, op contracts.Operation) error {
@@ -42,13 +44,16 @@ func LoggingMiddleware(logger Logger) Middleware {
 			err := next(ctx, op)
 			latency := time.Since(start)
 
-			logger.Log(LogEntry{
-				Op:      op.Name,
-				Backend: op.Backend,
-				Key:     op.Key,
-				Latency: latency,
-				Err:     err,
-			})
+			// Don't log NotFound errors - they are expected cache misses
+			if err != nil && !cacheerrors.Factory.IsNotFound(err) {
+				logger.Log(LogEntry{
+					Op:      op.Name,
+					Backend: op.Backend,
+					Key:     op.Key,
+					Latency: latency,
+					Err:     err,
+				})
+			}
 
 			return err
 		}

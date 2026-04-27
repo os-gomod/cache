@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/os-gomod/cache/v2/internal/contracts"
 	"github.com/os-gomod/cache/v2/internal/errors"
 	"github.com/os-gomod/cache/v2/internal/serialization"
@@ -27,14 +29,15 @@ import (
 //	tc.Set(ctx, "name", "Alice", time.Minute)
 //	name, err := tc.Get(ctx, "name") // name is string
 type TypedCache[T any] struct {
-	backend contracts.Reader
-	writer  contracts.Writer
-	atomic  contracts.AtomicOps
-	scanner contracts.Scanner
-	life    contracts.Lifecycle
-	stats   contracts.StatsProvider
-	codec   serialization.Codec[T]
-	bufPool *serialization.BufPool
+	backend            contracts.Reader
+	writer             contracts.Writer
+	atomic             contracts.AtomicOps
+	scanner            contracts.Scanner
+	life               contracts.Lifecycle
+	stats              contracts.StatsProvider
+	codec              serialization.Codec[T]
+	bufPool            *serialization.BufPool
+	singleflightGroups sync.Map // key -> *singleflight.Group
 }
 
 // TypedOption is a functional option for configuring a TypedCache.
@@ -159,8 +162,10 @@ func (tc *TypedCache[T]) DeleteMulti(ctx context.Context, keys ...string) error 
 // or expired, fn is called to produce the value, which is then stored
 // with the given TTL. This implements the cache-aside pattern.
 //
-// The function fn is guaranteed to be called at most once per invocation,
-// even under concurrent access for the same key.
+// The function fn is guaranteed to be called at most once per cache miss,
+// even under concurrent access for the same key. Concurrent callers for
+// the same key will wait for the first caller's fn result, preventing
+// thundering herd and duplicate loads.
 func (tc *TypedCache[T]) GetOrSet(ctx context.Context, key string, fn func() (T, error), ttl time.Duration) (T, error) {
 	var zero T
 
@@ -174,11 +179,25 @@ func (tc *TypedCache[T]) GetOrSet(ctx context.Context, key string, fn func() (T,
 		return zero, err
 	}
 
-	newVal, err := fn()
+	// Use singleflight to deduplicate concurrent loads for the same key.
+	// Get or create a singleflight.Group for this key (lazily created).
+	sfGroupInterface, _ := tc.singleflightGroups.LoadOrStore(key, &singleflight.Group{})
+	sfGroup := sfGroupInterface.(*singleflight.Group)
+
+	// Execute fn only once, even with concurrent callers for the same key.
+	// All concurrent callers will receive the same result.
+	result, err, _ := sfGroup.Do("load", func() (interface{}, error) {
+		return fn()
+	})
+
 	if err != nil {
 		return zero, errors.Factory.CallbackFailed(key, err)
 	}
 
+	newVal := result.(T)
+
+	// Try to set (even if another goroutine set it concurrently)
+	// This is a benign race - both sets have the same value
 	if setErr := tc.Set(ctx, key, newVal, ttl); setErr != nil {
 		return newVal, nil // return the value even if set fails
 	}

@@ -2,11 +2,11 @@ package middleware
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
 	"github.com/os-gomod/cache/v2/internal/contracts"
+	cacheerrors "github.com/os-gomod/cache/v2/internal/errors"
 )
 
 // RateLimiterConfig holds the configuration for the token bucket rate limiter middleware.
@@ -67,14 +67,14 @@ func (tb *tokenBucket) allow() bool {
 
 // RateLimiterMiddleware returns a Middleware that limits the rate of cache
 // operations using a token bucket algorithm. When no tokens are available,
-// the operation is rejected with an error.
+// the operation is rejected with a proper RateLimited error.
 func RateLimiterMiddleware(cfg RateLimiterConfig) Middleware {
 	tb := newTokenBucket(cfg)
 
 	return func(next Handler) Handler {
 		return func(ctx context.Context, op contracts.Operation) error {
 			if !tb.allow() {
-				return fmt.Errorf("rate limit exceeded for operation %s", op.Name)
+				return cacheerrors.Factory.RateLimited(op.Name)
 			}
 			return next(ctx, op)
 		}

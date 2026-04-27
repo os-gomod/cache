@@ -12,11 +12,15 @@ import "github.com/redis/go-redis/v9"
 //	ARGV[2] = new value
 //	ARGV[3] = TTL in seconds (0 = no expiry)
 //
-// Returns 1 if the swap was performed, 0 otherwise.
+// Returns:
+//
+//	1  = swap performed successfully
+//	-1 = key not found
+//	0  = value mismatch
 var casScript = redis.NewScript(`
 local current = redis.call('GET', KEYS[1])
 if current == false then
-    return 0
+    return -1
 end
 if current ~= ARGV[1] then
     return 0

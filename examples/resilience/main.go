@@ -11,11 +11,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/os-gomod/cache/v2"
+	cacheerrors "github.com/os-gomod/cache/v2/internal/errors"
 	"github.com/os-gomod/cache/v2/internal/middleware"
 	"github.com/os-gomod/cache/v2/memory"
 )
@@ -138,11 +140,11 @@ func main() {
 	ops := 0
 	for i := range 60 {
 		_, err := rlOnly.Get(ctx, fmt.Sprintf("rl:test:%d", i))
-		if err != nil {
-			fmt.Printf("  Op %d: rate limited (expected after burst): %v\n", i+1, err)
-		} else {
-			ops++
+		if errors.Is(err, cacheerrors.ErrRateLimited) {
+			fmt.Println("RATE LIMITED")
+			continue
 		}
+		fmt.Println("MISS")
 	}
 	elapsed := time.Since(start)
 	fmt.Printf("Completed %d/%d ops in %v\n", ops, 60, elapsed)
