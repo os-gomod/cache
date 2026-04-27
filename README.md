@@ -1,16 +1,5 @@
 # os-gomod/cache v2
 
-<p align="center">
-  <strong>Enterprise-grade, high-performance caching platform for Go</strong>
-</p>
-
-<p align="center">
-  <a href="https://pkg.go.dev/github.com/os-gomod/cache/v2"><img src="https://pkg.go.dev/badge/github.com/os-gomod/cache/v2.svg" alt="Go Reference"></a>
-  <a href="https://goreportcard.com/report/github.com/os-gomod/cache/v2"><img src="https://goreportcard.com/badge/github.com/os-gomod/cache/v2" alt="Go Report Card"></a>
-  <a href="https://github.com/os-gomod/cache/v2/actions"><img src="https://github.com/os-gomod/cache/v2/workflows/CI/badge.svg" alt="CI"></a>
-  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License"></a>
-</p>
-
 ## Features
 
 - **Multi-backend**: Memory, Redis, Layered (L1 memory + L2 Redis)
