@@ -11,6 +11,7 @@ import (
 
 	"github.com/os-gomod/cache/v2/internal/contracts"
 	cacheerrors "github.com/os-gomod/cache/v2/internal/errors"
+	"github.com/os-gomod/cache/v2/internal/keyutil"
 	"github.com/os-gomod/cache/v2/internal/runtime"
 )
 
@@ -23,7 +24,7 @@ func (s *Store) CompareAndSwap(ctx context.Context, key string, oldVal, newVal [
 	}
 
 	effectiveTTL := s.resolveTTL(ttl)
-	rk := s.buildKey(key)
+	rk := keyutil.BuildKey(s.cfg.keyPrefix, key)
 	ttlSeconds := int64(effectiveTTL.Seconds())
 
 	op := contracts.Operation{
@@ -65,7 +66,7 @@ func (s *Store) SetNX(ctx context.Context, key string, value []byte, ttl time.Du
 	}
 
 	effectiveTTL := s.resolveTTL(ttl)
-	rk := s.buildKey(key)
+	rk := keyutil.BuildKey(s.cfg.keyPrefix, key)
 
 	op := contracts.Operation{
 		Name:    "setnx",
@@ -94,7 +95,7 @@ func (s *Store) Increment(ctx context.Context, key string, delta int64) (int64, 
 		return 0, err
 	}
 
-	rk := s.buildKey(key)
+	rk := keyutil.BuildKey(s.cfg.keyPrefix, key)
 
 	op := contracts.Operation{
 		Name:    "increment",
@@ -127,7 +128,7 @@ func (s *Store) GetSet(ctx context.Context, key string, value []byte, ttl time.D
 	}
 
 	effectiveTTL := s.resolveTTL(ttl)
-	rk := s.buildKey(key)
+	rk := keyutil.BuildKey(s.cfg.keyPrefix, key)
 	ttlSeconds := int64(effectiveTTL.Seconds())
 
 	op := contracts.Operation{

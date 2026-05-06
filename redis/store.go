@@ -8,7 +8,6 @@ import (
 
 	"github.com/os-gomod/cache/v2/internal/contracts"
 	"github.com/os-gomod/cache/v2/internal/errors"
-	"github.com/os-gomod/cache/v2/internal/keyutil"
 	"github.com/os-gomod/cache/v2/internal/lifecycle"
 	"github.com/os-gomod/cache/v2/internal/middleware"
 	"github.com/os-gomod/cache/v2/internal/runtime"
@@ -132,11 +131,6 @@ func (s *Store) Stats() contracts.StatsSnapshot {
 // not covered by the Cache interface (e.g., transactions, pub/sub).
 func (s *Store) Client() redis.UniversalClient {
 	return s.client
-}
-
-// buildKey prepends the configured key prefix to the raw key.
-func (s *Store) buildKey(key string) string {
-	return keyutil.BuildKey(s.cfg.keyPrefix, key)
 }
 
 // checkClosed returns an error if the store is closed.

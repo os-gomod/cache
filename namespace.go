@@ -6,6 +6,7 @@ import (
 
 	"github.com/os-gomod/cache/v2/internal/contracts"
 	"github.com/os-gomod/cache/v2/internal/errors"
+	"github.com/os-gomod/cache/v2/internal/keyutil"
 )
 
 // Namespace provides key-prefixed isolation within a cache backend.
@@ -41,21 +42,16 @@ func NewNamespace(prefix string, backend Backend) (*Namespace, error) {
 	}, nil
 }
 
-// prefixedKey returns the full key with the namespace prefix prepended.
-func (n *Namespace) prefixedKey(key string) string {
-	return n.prefix + ":" + key
-}
-
 // Get retrieves the value for the given key from the namespace.
 func (n *Namespace) Get(ctx context.Context, key string) ([]byte, error) {
-	return n.backend.Get(ctx, n.prefixedKey(key))
+	return n.backend.Get(ctx, keyutil.BuildKey(n.prefix, key))
 }
 
 // GetMulti retrieves multiple values from the namespace.
 func (n *Namespace) GetMulti(ctx context.Context, keys ...string) (map[string][]byte, error) {
 	prefixed := make([]string, len(keys))
 	for i, k := range keys {
-		prefixed[i] = n.prefixedKey(k)
+		prefixed[i] = keyutil.BuildKey(n.prefix, k)
 	}
 	dataMap, err := n.backend.GetMulti(ctx, prefixed...)
 	if err != nil {
@@ -74,73 +70,73 @@ func (n *Namespace) GetMulti(ctx context.Context, keys ...string) (map[string][]
 
 // Exists checks whether the key exists in the namespace.
 func (n *Namespace) Exists(ctx context.Context, key string) (bool, error) {
-	return n.backend.Exists(ctx, n.prefixedKey(key))
+	return n.backend.Exists(ctx, keyutil.BuildKey(n.prefix, key))
 }
 
 // TTL returns the remaining time-to-live for the given key.
 func (n *Namespace) TTL(ctx context.Context, key string) (time.Duration, error) {
-	return n.backend.TTL(ctx, n.prefixedKey(key))
+	return n.backend.TTL(ctx, keyutil.BuildKey(n.prefix, key))
 }
 
 // Set stores the value under the namespaced key.
 func (n *Namespace) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
-	return n.backend.Set(ctx, n.prefixedKey(key), value, ttl)
+	return n.backend.Set(ctx, keyutil.BuildKey(n.prefix, key), value, ttl)
 }
 
 // SetMulti stores multiple values in the namespace.
 func (n *Namespace) SetMulti(ctx context.Context, items map[string][]byte, ttl time.Duration) error {
 	prefixed := make(map[string][]byte, len(items))
 	for k, v := range items {
-		prefixed[n.prefixedKey(k)] = v
+		prefixed[keyutil.BuildKey(n.prefix, k)] = v
 	}
 	return n.backend.SetMulti(ctx, prefixed, ttl)
 }
 
 // Delete removes the key from the namespace.
 func (n *Namespace) Delete(ctx context.Context, key string) error {
-	return n.backend.Delete(ctx, n.prefixedKey(key))
+	return n.backend.Delete(ctx, keyutil.BuildKey(n.prefix, key))
 }
 
 // DeleteMulti removes multiple keys from the namespace.
 func (n *Namespace) DeleteMulti(ctx context.Context, keys ...string) error {
 	prefixed := make([]string, len(keys))
 	for i, k := range keys {
-		prefixed[i] = n.prefixedKey(k)
+		prefixed[i] = keyutil.BuildKey(n.prefix, k)
 	}
 	return n.backend.DeleteMulti(ctx, prefixed...)
 }
 
 // CompareAndSwap atomically compares and swaps within the namespace.
 func (n *Namespace) CompareAndSwap(ctx context.Context, key string, oldValue, newValue []byte, ttl time.Duration) (bool, error) {
-	return n.backend.CompareAndSwap(ctx, n.prefixedKey(key), oldValue, newValue, ttl)
+	return n.backend.CompareAndSwap(ctx, keyutil.BuildKey(n.prefix, key), oldValue, newValue, ttl)
 }
 
 // SetNX sets the key only if it does not exist, within the namespace.
 func (n *Namespace) SetNX(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
-	return n.backend.SetNX(ctx, n.prefixedKey(key), value, ttl)
+	return n.backend.SetNX(ctx, keyutil.BuildKey(n.prefix, key), value, ttl)
 }
 
 // Increment atomically increments a numeric value within the namespace.
 func (n *Namespace) Increment(ctx context.Context, key string, delta int64) (int64, error) {
-	return n.backend.Increment(ctx, n.prefixedKey(key), delta)
+	return n.backend.Increment(ctx, keyutil.BuildKey(n.prefix, key), delta)
 }
 
 // Decrement atomically decrements a numeric value within the namespace.
 func (n *Namespace) Decrement(ctx context.Context, key string, delta int64) (int64, error) {
-	return n.backend.Decrement(ctx, n.prefixedKey(key), delta)
+	return n.backend.Decrement(ctx, keyutil.BuildKey(n.prefix, key), delta)
 }
 
 // GetSet atomically sets a value and returns the previous value within
 // the namespace.
 func (n *Namespace) GetSet(ctx context.Context, key string, value []byte, ttl time.Duration) ([]byte, error) {
-	return n.backend.GetSet(ctx, n.prefixedKey(key), value, ttl)
+	return n.backend.GetSet(ctx, keyutil.BuildKey(n.prefix, key), value, ttl)
 }
 
 // Keys returns all keys matching the pattern within the namespace.
 // The pattern is matched against the original (non-prefixed) keys.
 func (n *Namespace) Keys(ctx context.Context, pattern string) ([]string, error) {
 	// Prepend prefix to the pattern for backend matching.
-	backendPattern := n.prefix + ":" + pattern
+	backendPattern := keyutil.BuildKey(n.prefix, pattern)
 	keys, err := n.backend.Keys(ctx, backendPattern)
 	if err != nil {
 		return nil, err

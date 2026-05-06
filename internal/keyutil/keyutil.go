@@ -8,13 +8,18 @@ import (
 	cacheerrors "github.com/os-gomod/cache/v2/internal/errors"
 )
 
+const KeySeparator = ":"
+
 // BuildKey prepends the given prefix to the key. If prefix is empty, the key
 // is returned unchanged.
 func BuildKey(prefix, key string) string {
 	if prefix == "" {
 		return key
 	}
-	return prefix + key
+	if key == "" {
+		return prefix
+	}
+	return prefix + KeySeparator + key
 }
 
 // StripPrefix removes the given prefix from the key. If prefix is empty or the

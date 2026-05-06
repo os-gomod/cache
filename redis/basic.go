@@ -29,7 +29,7 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 
 	//nolint:wrapcheck // error is already wrapped by internal packages
 	return runtime.ExecuteTyped(s.executor, ctx, op, func(ctx context.Context) ([]byte, error) {
-		rk := s.buildKey(key)
+		rk := keyutil.BuildKey(s.cfg.keyPrefix, key)
 		result, err := s.client.Get(ctx, rk).Bytes()
 		if err != nil {
 			if errors.Is(err, redis.Nil) {
@@ -65,7 +65,7 @@ func (s *Store) GetMulti(ctx context.Context, keys ...string) (map[string][]byte
 		// Build piped commands for all keys
 		pipes := make(map[string]string, len(keys))
 		for _, key := range keys {
-			pipes[s.buildKey(key)] = key
+			pipes[keyutil.BuildKey(s.cfg.keyPrefix, key)] = key
 		}
 
 		pipe := s.client.Pipeline()
@@ -113,7 +113,7 @@ func (s *Store) Set(ctx context.Context, key string, value []byte, ttl time.Dura
 
 	//nolint:wrapcheck // error is already wrapped by internal packages
 	return s.executor.Execute(ctx, op, func(ctx context.Context) error {
-		rk := s.buildKey(key)
+		rk := keyutil.BuildKey(s.cfg.keyPrefix, key)
 		if err := s.client.Set(ctx, rk, value, effectiveTTL).Err(); err != nil {
 			s.stats.ErrorOp()
 			return cacheerrors.Factory.Connection("redis.set", err)
@@ -145,7 +145,7 @@ func (s *Store) SetMulti(ctx context.Context, items map[string][]byte, ttl time.
 	return s.executor.Execute(ctx, op, func(ctx context.Context) error {
 		pipe := s.client.Pipeline()
 		for key, value := range items {
-			rk := s.buildKey(key)
+			rk := keyutil.BuildKey(s.cfg.keyPrefix, key)
 			pipe.Set(ctx, rk, value, effectiveTTL)
 		}
 		if _, err := pipe.Exec(ctx); err != nil {
@@ -171,7 +171,7 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 
 	//nolint:wrapcheck // error is already wrapped by internal packages
 	return s.executor.Execute(ctx, op, func(ctx context.Context) error {
-		rk := s.buildKey(key)
+		rk := keyutil.BuildKey(s.cfg.keyPrefix, key)
 		if err := s.client.Del(ctx, rk).Err(); err != nil {
 			s.stats.ErrorOp()
 			return cacheerrors.Factory.Connection("redis.delete", err)
@@ -200,7 +200,7 @@ func (s *Store) DeleteMulti(ctx context.Context, keys ...string) error {
 	return s.executor.Execute(ctx, op, func(ctx context.Context) error {
 		rks := make([]string, len(keys))
 		for i, key := range keys {
-			rks[i] = s.buildKey(key)
+			rks[i] = keyutil.BuildKey(s.cfg.keyPrefix, key)
 		}
 		if err := s.client.Del(ctx, rks...).Err(); err != nil {
 			s.stats.ErrorOp()
@@ -225,7 +225,7 @@ func (s *Store) Exists(ctx context.Context, key string) (bool, error) {
 
 	//nolint:wrapcheck // error is already wrapped by internal packages
 	return runtime.ExecuteTyped(s.executor, ctx, op, func(ctx context.Context) (bool, error) {
-		rk := s.buildKey(key)
+		rk := keyutil.BuildKey(s.cfg.keyPrefix, key)
 		n, err := s.client.Exists(ctx, rk).Result()
 		if err != nil {
 			s.stats.ErrorOp()
@@ -249,7 +249,7 @@ func (s *Store) TTL(ctx context.Context, key string) (time.Duration, error) {
 
 	//nolint:wrapcheck // error is already wrapped by internal packages
 	return runtime.ExecuteTyped(s.executor, ctx, op, func(ctx context.Context) (time.Duration, error) {
-		rk := s.buildKey(key)
+		rk := keyutil.BuildKey(s.cfg.keyPrefix, key)
 		dur, err := s.client.TTL(ctx, rk).Result()
 		if err != nil {
 			s.stats.ErrorOp()
@@ -276,7 +276,7 @@ func (s *Store) Keys(ctx context.Context, pattern string) ([]string, error) {
 
 	//nolint:wrapcheck // error is already wrapped by internal packages
 	return runtime.ExecuteTyped(s.executor, ctx, op, func(ctx context.Context) ([]string, error) {
-		scanPattern := s.buildKey(pattern)
+		scanPattern := keyutil.BuildKey(s.cfg.keyPrefix, pattern)
 		if pattern == "" {
 			scanPattern = s.cfg.keyPrefix + "*"
 		}
